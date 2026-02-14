@@ -1,0 +1,11 @@
+[package]
+name = "cornell_egui_pathtracer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+crossbeam-channel = "0.5"
+eframe = "0.29"
+image = { version = "0.25", default-features = false, features = ["png"] }
+parking_lot = "0.12"
+rand = { version = "0.8", features = ["small_rng"] }
