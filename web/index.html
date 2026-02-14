@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cornell Box Path Tracer</title>
+  <style>
+    html,
+    body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      background: #000;
+      overflow: hidden;
+      font-family: sans-serif;
+    }
+
+    #the_canvas_id {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+
+    .loading {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #9aa4b2;
+      background: #000;
+      letter-spacing: 0.02em;
+    }
+  </style>
+</head>
+<body>
+  <div class="loading" id="loading">Loading WebAssembly renderer...</div>
+  <canvas id="the_canvas_id"></canvas>
+
+  <script type="module">
+    const loading = document.getElementById("loading");
+    const setLoadingMessage = (message) => {
+      if (loading) {
+        loading.textContent = message;
+        loading.style.display = "flex";
+        loading.style.whiteSpace = "pre-wrap";
+        loading.style.padding = "24px";
+        loading.style.textAlign = "left";
+      }
+    };
+
+    window.addEventListener("error", (event) => {
+      const details = event.error && event.error.stack
+        ? event.error.stack
+        : event.message;
+      setLoadingMessage(`Runtime error:\n${details}`);
+    });
+
+    window.addEventListener("unhandledrejection", (event) => {
+      const reason = event.reason && event.reason.stack
+        ? event.reason.stack
+        : `${event.reason}`;
+      setLoadingMessage(`Unhandled promise rejection:\n${reason}`);
+    });
+
+    if (!("gpu" in navigator)) {
+      setLoadingMessage("WebGPU is unavailable in this browser. Enable WebGPU and hardware acceleration, then reload.");
+    } else {
+      const cacheBust = Date.now().toString();
+      import(`./pkg/cornell_egui_pathtracer.js?v=${cacheBust}`)
+        .then(({ default: init }) => {
+          const wasmUrl = new URL(`./pkg/cornell_egui_pathtracer_bg.wasm?v=${cacheBust}`, import.meta.url);
+          return init(wasmUrl);
+        })
+        .catch((error) => {
+          setLoadingMessage(`Failed to initialize WebAssembly module: ${error}`);
+        });
+    }
+  </script>
+</body>
+</html>

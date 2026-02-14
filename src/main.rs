@@ -1,13 +1,28 @@
 use bytemuck::{Pod, Zeroable};
-use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender};
+use crossbeam_channel::Sender;
 use eframe::{egui, wgpu};
-use image::RgbaImage;
 use std::ops::{Add, Div, Mul, Neg, Sub};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+#[cfg(not(target_arch = "wasm32"))]
+use crossbeam_channel::{bounded, Receiver, RecvTimeoutError};
+#[cfg(not(target_arch = "wasm32"))]
+use image::RgbaImage;
+#[cfg(target_arch = "wasm32")]
+use std::cell::RefCell;
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::PathBuf;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::JsCast;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen_futures::spawn_local;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 
 const IMAGE_WIDTH: usize = 640;
 const IMAGE_HEIGHT: usize = 640;
@@ -18,6 +33,11 @@ const SNAPSHOT_FILE: &str = "snapshot.png";
 const CAMERA_MOVE_SPEED: f32 = 1.8;
 const CAMERA_LOOK_SENSITIVITY: f32 = 0.0028;
 const CAMERA_IDLE_TO_PATH: Duration = Duration::from_secs(1);
+
+#[cfg(target_arch = "wasm32")]
+std::thread_local! {
+    static WEB_RUNNER: RefCell<Option<eframe::WebRunner>> = const { RefCell::new(None) };
+}
 
 const PRIMITIVE_XY: u32 = 0;
 const PRIMITIVE_XZ: u32 = 1;
@@ -422,8 +442,8 @@ struct GpuPrimitive {
 }
 
 struct GpuPathTracer {
-    device: Arc<wgpu::Device>,
-    queue: Arc<wgpu::Queue>,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
     width: u32,
     height: u32,
     primitive_count: u32,
@@ -457,8 +477,8 @@ impl GpuPathTracer {
             return Err("Image dimensions must be non-zero".to_owned());
         }
 
-        let device = Arc::clone(&render_state.device);
-        let queue = Arc::clone(&render_state.queue);
+        let device = render_state.device.clone();
+        let queue = render_state.queue.clone();
 
         let gpu_primitives: Vec<GpuPrimitive> = scene
             .objects
@@ -612,7 +632,7 @@ impl GpuPathTracer {
             label: Some("pathtracer-compute"),
             layout: Some(&pipeline_layout),
             module: &shader,
-            entry_point: "main",
+            entry_point: Some("main"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
         });
@@ -745,15 +765,15 @@ impl GpuPathTracer {
             });
 
         encoder.copy_texture_to_buffer(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &self.output_texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            wgpu::ImageCopyBuffer {
+            wgpu::TexelCopyBufferInfo {
                 buffer: &self.readback_buffer,
-                layout: wgpu::ImageDataLayout {
+                layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(self.padded_bytes_per_row as u32),
                     rows_per_image: Some(self.height),
@@ -774,7 +794,7 @@ impl GpuPathTracer {
             let _ = sender.send(result);
         });
 
-        let _ = self.device.poll(wgpu::Maintain::Wait);
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
 
         let map_result = receiver
             .recv_timeout(Duration::from_secs(2))
@@ -808,10 +828,33 @@ impl GpuPathTracer {
     }
 }
 
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 struct SnapshotFrame {
     width: u32,
     height: u32,
     pixels: Vec<u8>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn start_snapshot_worker(
+    stop_flag: &Arc<AtomicBool>,
+) -> (Option<Sender<SnapshotFrame>>, Option<JoinHandle<()>>) {
+    let (snapshot_sender, snapshot_receiver) = bounded::<SnapshotFrame>(1);
+    let thread_stop = Arc::clone(stop_flag);
+    let output_path = PathBuf::from(SNAPSHOT_FILE);
+    let snapshot_thread = std::thread::Builder::new()
+        .name("snapshot-writer".to_owned())
+        .spawn(move || snapshot_writer_loop(snapshot_receiver, thread_stop, output_path))
+        .ok();
+
+    (Some(snapshot_sender), snapshot_thread)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn start_snapshot_worker(
+    _stop_flag: &Arc<AtomicBool>,
+) -> (Option<Sender<SnapshotFrame>>, Option<JoinHandle<()>>) {
+    (None, None)
 }
 
 struct PathTracerApp {
@@ -834,16 +877,7 @@ struct PathTracerApp {
 impl PathTracerApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let stop_flag = Arc::new(AtomicBool::new(false));
-
-        let (snapshot_sender, snapshot_receiver) = bounded::<SnapshotFrame>(1);
-        let snapshot_thread = {
-            let thread_stop = Arc::clone(&stop_flag);
-            let output_path = PathBuf::from(SNAPSHOT_FILE);
-            thread::Builder::new()
-                .name("snapshot-writer".to_owned())
-                .spawn(move || snapshot_writer_loop(snapshot_receiver, thread_stop, output_path))
-                .ok()
-        };
+        let (snapshot_sender, snapshot_thread) = start_snapshot_worker(&stop_flag);
 
         let camera_origin = Vec3::new(0.5, 0.5, -2.2);
         let camera_target = Vec3::new(0.5, 0.5, 0.5);
@@ -882,6 +916,8 @@ impl PathTracerApp {
         };
 
         let gpu_texture_id = gpu.as_ref().map(GpuPathTracer::texture_id);
+        let now = Instant::now();
+        let initial_camera_motion = now.checked_sub(CAMERA_IDLE_TO_PATH).unwrap_or(now);
 
         Self {
             gpu,
@@ -891,13 +927,13 @@ impl PathTracerApp {
             render_mode: RenderMode::Path,
             rgba_buffer: vec![0_u8; IMAGE_WIDTH * IMAGE_HEIGHT * 4],
             stop_flag,
-            snapshot_sender: Some(snapshot_sender),
+            snapshot_sender,
             snapshot_thread,
-            last_snapshot: Instant::now(),
-            last_camera_motion: Instant::now() - CAMERA_IDLE_TO_PATH,
-            last_frame_time: Instant::now(),
+            last_snapshot: now,
+            last_camera_motion: initial_camera_motion,
+            last_frame_time: now,
             dump_interval: SNAPSHOT_INTERVAL,
-            started_at: Instant::now(),
+            started_at: now,
         }
     }
 
@@ -934,6 +970,10 @@ impl PathTracerApp {
     }
 
     fn maybe_queue_snapshot(&mut self) {
+        if self.snapshot_sender.is_none() {
+            return;
+        }
+
         if self.last_snapshot.elapsed() < self.dump_interval {
             return;
         }
@@ -984,6 +1024,11 @@ impl eframe::App for PathTracerApp {
         } else {
             "Total samples: paused".to_owned()
         };
+        let snapshot_label = if self.snapshot_sender.is_some() {
+            format!("Snapshot: {SNAPSHOT_FILE}")
+        } else {
+            "Snapshot: disabled".to_owned()
+        };
 
         egui::TopBottomPanel::top("status").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -999,7 +1044,7 @@ impl eframe::App for PathTracerApp {
                 ui.separator();
                 ui.label(format!("Elapsed: {:.1}s", elapsed));
                 ui.separator();
-                ui.label(format!("Snapshot: {}", SNAPSHOT_FILE));
+                ui.label(snapshot_label.as_str());
             });
             ui.label("Controls: WASD move, hold right mouse + drag to look");
 
@@ -1852,6 +1897,7 @@ fn add_slowpoke(
     );
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn snapshot_writer_loop(
     receiver: Receiver<SnapshotFrame>,
     stop_flag: Arc<AtomicBool>,
@@ -1874,6 +1920,7 @@ fn snapshot_writer_loop(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
@@ -1888,4 +1935,87 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(PathTracerApp::new(cc)))),
     )
+}
+
+#[cfg(target_arch = "wasm32")]
+fn set_loading_text(text: &str) {
+    if let Some(document) = web_sys::window().and_then(|window| window.document()) {
+        if let Some(loading) = document.get_element_by_id("loading") {
+            loading.set_text_content(Some(text));
+            let _ = loading.set_attribute("style", "display:flex");
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn hide_loading_overlay() {
+    if let Some(document) = web_sys::window().and_then(|window| window.document()) {
+        if let Some(loading) = document.get_element_by_id("loading") {
+            let _ = loading.set_attribute("style", "display:none");
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn js_value_to_string(value: wasm_bindgen::JsValue) -> String {
+    value.as_string().unwrap_or_else(|| format!("{value:?}"))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn format_web_start_error(raw: String) -> String {
+    if raw.contains("no suitable adapter found") {
+        return "WebGPU adapter was not found. Enable hardware acceleration and WebGPU in Chrome, then reload."
+            .to_owned();
+    }
+
+    format!("Failed to start web renderer: {raw}")
+}
+
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    console_error_panic_hook::set_once();
+
+    let runner = WEB_RUNNER.with(|runner| {
+        let mut runner = runner.borrow_mut();
+        if runner.is_none() {
+            *runner = Some(eframe::WebRunner::new());
+        }
+        runner
+            .as_ref()
+            .expect("web runner must exist after initialization")
+            .clone()
+    });
+
+    spawn_local(async move {
+        let start_result: Result<(), String> = async {
+            let window = web_sys::window().ok_or_else(|| "window is unavailable".to_owned())?;
+            let document = window
+                .document()
+                .ok_or_else(|| "document is unavailable".to_owned())?;
+            let canvas = document
+                .get_element_by_id("the_canvas_id")
+                .ok_or_else(|| "missing canvas with id 'the_canvas_id'".to_owned())?
+                .dyn_into::<web_sys::HtmlCanvasElement>()
+                .map_err(|_| "element with id 'the_canvas_id' is not a canvas".to_owned())?;
+
+            let web_options = eframe::WebOptions::default();
+
+            hide_loading_overlay();
+
+            runner
+                .start(
+                    canvas,
+                    web_options,
+                    Box::new(|cc| Ok(Box::new(PathTracerApp::new(cc)))),
+                )
+                .await
+                .map_err(js_value_to_string)
+        }
+        .await;
+
+        match start_result {
+            Ok(()) => hide_loading_overlay(),
+            Err(err) => set_loading_text(format_web_start_error(err).as_str()),
+        }
+    });
 }
