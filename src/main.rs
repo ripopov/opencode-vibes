@@ -285,6 +285,7 @@ struct GpuPathTracer {
     _accumulation_buffer: wgpu::Buffer,
     output_texture: wgpu::Texture,
     _output_view: wgpu::TextureView,
+    texture_id: egui::TextureId,
     readback_buffer: wgpu::Buffer,
     padded_bytes_per_row: usize,
     bind_group: wgpu::BindGroup,
@@ -355,10 +356,17 @@ impl GpuPathTracer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+            usage: wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         let output_view = output_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let texture_id = {
+            let mut renderer = render_state.renderer.write();
+            renderer.register_native_texture(&device, &output_view, wgpu::FilterMode::Linear)
+        };
 
         let padded_bytes_per_row = padded_bytes_per_row(width);
         let readback_size = padded_bytes_per_row as u64 * height as u64;
@@ -470,6 +478,7 @@ impl GpuPathTracer {
             _accumulation_buffer: accumulation_buffer,
             output_texture,
             _output_view: output_view,
+            texture_id,
             readback_buffer,
             padded_bytes_per_row,
             bind_group,
@@ -479,15 +488,7 @@ impl GpuPathTracer {
         })
     }
 
-    fn render_sample(&mut self, output: &mut [u8]) -> Result<(), String> {
-        let expected_len = self.width as usize * self.height as usize * 4;
-        if output.len() != expected_len {
-            return Err(format!(
-                "RGBA output length mismatch: expected {expected_len}, got {}",
-                output.len()
-            ));
-        }
-
+    fn render_sample(&mut self) {
         let uniforms = GpuUniforms::new(
             self.width,
             self.height,
@@ -514,6 +515,30 @@ impl GpuPathTracer {
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.dispatch_workgroups(self.width.div_ceil(8), self.height.div_ceil(8), 1);
         }
+
+        self.queue.submit(Some(encoder.finish()));
+
+        self.sample_index = self.sample_index.saturating_add(1);
+        self.seed = self
+            .seed
+            .wrapping_mul(1_664_525)
+            .wrapping_add(1_013_904_223);
+    }
+
+    fn readback_output(&self, output: &mut [u8]) -> Result<(), String> {
+        let expected_len = self.width as usize * self.height as usize * 4;
+        if output.len() != expected_len {
+            return Err(format!(
+                "RGBA output length mismatch: expected {expected_len}, got {}",
+                output.len()
+            ));
+        }
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("pathtracer-readback-encoder"),
+            });
 
         encoder.copy_texture_to_buffer(
             wgpu::ImageCopyTexture {
@@ -563,13 +588,11 @@ impl GpuPathTracer {
         drop(data);
         self.readback_buffer.unmap();
 
-        self.sample_index = self.sample_index.saturating_add(1);
-        self.seed = self
-            .seed
-            .wrapping_mul(1_664_525)
-            .wrapping_add(1_013_904_223);
-
         Ok(())
+    }
+
+    fn texture_id(&self) -> egui::TextureId {
+        self.texture_id
     }
 
     fn sample_count(&self) -> u32 {
@@ -589,8 +612,8 @@ struct SnapshotFrame {
 
 struct PathTracerApp {
     gpu: Option<GpuPathTracer>,
+    gpu_texture_id: Option<egui::TextureId>,
     init_error: Option<String>,
-    texture: Option<egui::TextureHandle>,
     rgba_buffer: Vec<u8>,
     stop_flag: Arc<AtomicBool>,
     snapshot_sender: Option<Sender<SnapshotFrame>>,
@@ -650,10 +673,12 @@ impl PathTracerApp {
             ),
         };
 
+        let gpu_texture_id = gpu.as_ref().map(GpuPathTracer::texture_id);
+
         Self {
             gpu,
+            gpu_texture_id,
             init_error,
-            texture: None,
             rgba_buffer: vec![0_u8; IMAGE_WIDTH * IMAGE_HEIGHT * 4],
             stop_flag,
             snapshot_sender: Some(snapshot_sender),
@@ -664,22 +689,19 @@ impl PathTracerApp {
         }
     }
 
-    fn refresh_texture(&mut self, ctx: &egui::Context) {
-        let color_image = egui::ColorImage::from_rgba_unmultiplied(
-            [IMAGE_WIDTH, IMAGE_HEIGHT],
-            &self.rgba_buffer,
-        );
-
-        if let Some(texture) = &mut self.texture {
-            texture.set(color_image, egui::TextureOptions::LINEAR);
-        } else {
-            self.texture =
-                Some(ctx.load_texture("pathtracer", color_image, egui::TextureOptions::LINEAR));
-        }
-    }
-
     fn maybe_queue_snapshot(&mut self) {
         if self.last_snapshot.elapsed() < self.dump_interval {
+            return;
+        }
+
+        if let Some(gpu) = self.gpu.as_ref() {
+            if let Err(err) = gpu.readback_output(&mut self.rgba_buffer) {
+                self.init_error = Some(format!("Snapshot readback failed: {err}"));
+                self.last_snapshot = Instant::now();
+                return;
+            }
+        } else {
+            self.last_snapshot = Instant::now();
             return;
         }
 
@@ -699,13 +721,8 @@ impl PathTracerApp {
 impl eframe::App for PathTracerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if let Some(gpu) = &mut self.gpu {
-            if let Err(err) = gpu.render_sample(&mut self.rgba_buffer) {
-                self.init_error = Some(format!("GPU render failed: {err}"));
-                self.gpu = None;
-            } else {
-                self.refresh_texture(ctx);
-                self.maybe_queue_snapshot();
-            }
+            gpu.render_sample();
+            self.maybe_queue_snapshot();
         }
 
         let elapsed = self.started_at.elapsed().as_secs_f32();
@@ -733,7 +750,7 @@ impl eframe::App for PathTracerApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            if let Some(texture) = &self.texture {
+            if let Some(texture_id) = self.gpu_texture_id {
                 let image_size = egui::vec2(IMAGE_WIDTH as f32, IMAGE_HEIGHT as f32);
                 let avail = ui.available_size();
                 let scale = (avail.x / image_size.x)
@@ -742,7 +759,7 @@ impl eframe::App for PathTracerApp {
                 let desired = image_size * scale;
 
                 ui.centered_and_justified(|ui| {
-                    ui.add(egui::Image::new(texture).fit_to_exact_size(desired));
+                    ui.add(egui::Image::new((texture_id, image_size)).fit_to_exact_size(desired));
                 });
             } else {
                 ui.centered_and_justified(|ui| {
