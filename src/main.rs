@@ -1,21 +1,29 @@
+use bytemuck::{Pod, Zeroable};
 use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender};
-use eframe::egui;
+use eframe::{egui, wgpu};
 use image::RgbaImage;
-use parking_lot::Mutex;
-use rand::rngs::SmallRng;
-use rand::{Rng, SeedableRng};
-use std::ops::{Add, AddAssign, Div, DivAssign, Mul, Neg, Sub};
+use std::ops::{Add, Div, Mul, Neg, Sub};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const IMAGE_WIDTH: usize = 640;
 const IMAGE_HEIGHT: usize = 640;
-const MAX_BOUNCES: usize = 10;
+const MAX_BOUNCES: u32 = 10;
 const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(3);
 const SNAPSHOT_FILE: &str = "snapshot.png";
+
+const PRIMITIVE_XY: u32 = 0;
+const PRIMITIVE_XZ: u32 = 1;
+const PRIMITIVE_YZ: u32 = 2;
+const PRIMITIVE_SPHERE: u32 = 3;
+
+const MATERIAL_DIFFUSE: u32 = 0;
+const MATERIAL_METAL: u32 = 1;
+const MATERIAL_GLOSSY: u32 = 2;
+const MATERIAL_EMISSIVE: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct Vec3 {
@@ -25,8 +33,6 @@ struct Vec3 {
 }
 
 impl Vec3 {
-    const ZERO: Self = Self::splat(0.0);
-
     const fn new(x: f32, y: f32, z: f32) -> Self {
         Self { x, y, z }
     }
@@ -60,16 +66,8 @@ impl Vec3 {
         if len > 0.0 {
             self / len
         } else {
-            Self::ZERO
+            Self::new(0.0, 0.0, 0.0)
         }
-    }
-
-    fn mul_elem(self, rhs: Self) -> Self {
-        Self::new(self.x * rhs.x, self.y * rhs.y, self.z * rhs.z)
-    }
-
-    fn max_component(self) -> f32 {
-        self.x.max(self.y).max(self.z)
     }
 }
 
@@ -78,14 +76,6 @@ impl Add for Vec3 {
 
     fn add(self, rhs: Self) -> Self::Output {
         Self::new(self.x + rhs.x, self.y + rhs.y, self.z + rhs.z)
-    }
-}
-
-impl AddAssign for Vec3 {
-    fn add_assign(&mut self, rhs: Self) {
-        self.x += rhs.x;
-        self.y += rhs.y;
-        self.z += rhs.z;
     }
 }
 
@@ -121,38 +111,11 @@ impl Div<f32> for Vec3 {
     }
 }
 
-impl DivAssign<f32> for Vec3 {
-    fn div_assign(&mut self, rhs: f32) {
-        self.x /= rhs;
-        self.y /= rhs;
-        self.z /= rhs;
-    }
-}
-
 impl Neg for Vec3 {
     type Output = Self;
 
     fn neg(self) -> Self::Output {
         Self::new(-self.x, -self.y, -self.z)
-    }
-}
-
-#[derive(Clone, Copy)]
-struct Ray {
-    origin: Vec3,
-    direction: Vec3,
-}
-
-impl Ray {
-    fn new(origin: Vec3, direction: Vec3) -> Self {
-        Self {
-            origin,
-            direction: direction.normalized(),
-        }
-    }
-
-    fn at(self, t: f32) -> Vec3 {
-        self.origin + self.direction * t
     }
 }
 
@@ -173,80 +136,6 @@ enum Material {
     Emissive {
         color: Vec3,
     },
-}
-
-impl Material {
-    fn emitted(self) -> Vec3 {
-        match self {
-            Self::Emissive { color } => color,
-            _ => Vec3::ZERO,
-        }
-    }
-
-    fn scatter(self, ray_in: &Ray, hit: &HitRecord, rng: &mut SmallRng) -> Option<(Ray, Vec3)> {
-        match self {
-            Self::Diffuse { albedo } => {
-                let direction = cosine_hemisphere(hit.normal, rng);
-                Some((Ray::new(hit.point + hit.normal * 1e-4, direction), albedo))
-            }
-            Self::Metal { albedo, fuzz } => {
-                let reflected = reflect(ray_in.direction, hit.normal);
-                let direction = (reflected + random_in_unit_sphere(rng) * fuzz).normalized();
-                if direction.dot(hit.normal) > 0.0 {
-                    Some((Ray::new(hit.point + hit.normal * 1e-4, direction), albedo))
-                } else {
-                    None
-                }
-            }
-            Self::Glossy {
-                albedo,
-                roughness,
-                reflectivity,
-            } => {
-                if rng.gen::<f32>() < reflectivity {
-                    let reflected = reflect(ray_in.direction, hit.normal);
-                    let direction =
-                        (reflected + random_in_unit_sphere(rng) * roughness).normalized();
-                    if direction.dot(hit.normal) > 0.0 {
-                        Some((Ray::new(hit.point + hit.normal * 1e-4, direction), albedo))
-                    } else {
-                        let diffuse = cosine_hemisphere(hit.normal, rng);
-                        Some((Ray::new(hit.point + hit.normal * 1e-4, diffuse), albedo))
-                    }
-                } else {
-                    let diffuse = cosine_hemisphere(hit.normal, rng);
-                    Some((Ray::new(hit.point + hit.normal * 1e-4, diffuse), albedo))
-                }
-            }
-            Self::Emissive { .. } => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct HitRecord {
-    point: Vec3,
-    normal: Vec3,
-    t: f32,
-    material: Material,
-}
-
-impl HitRecord {
-    fn new(ray: &Ray, t: f32, point: Vec3, outward_normal: Vec3, material: Material) -> Self {
-        let front_face = ray.direction.dot(outward_normal) < 0.0;
-        let normal = if front_face {
-            outward_normal
-        } else {
-            -outward_normal
-        };
-
-        Self {
-            point,
-            normal,
-            t,
-            material,
-        }
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -297,126 +186,8 @@ enum Primitive {
     Sphere(Sphere),
 }
 
-impl Primitive {
-    fn hit(self, ray: &Ray, t_min: f32, t_max: f32) -> Option<HitRecord> {
-        match self {
-            Self::XY(rect) => {
-                if ray.direction.z.abs() < 1e-6 {
-                    return None;
-                }
-                let t = (rect.z - ray.origin.z) / ray.direction.z;
-                if t <= t_min || t >= t_max {
-                    return None;
-                }
-                let x = ray.origin.x + t * ray.direction.x;
-                let y = ray.origin.y + t * ray.direction.y;
-                if x < rect.x0 || x > rect.x1 || y < rect.y0 || y > rect.y1 {
-                    return None;
-                }
-                let point = ray.at(t);
-                Some(HitRecord::new(
-                    ray,
-                    t,
-                    point,
-                    Vec3::new(0.0, 0.0, rect.normal_z),
-                    rect.material,
-                ))
-            }
-            Self::XZ(rect) => {
-                if ray.direction.y.abs() < 1e-6 {
-                    return None;
-                }
-                let t = (rect.y - ray.origin.y) / ray.direction.y;
-                if t <= t_min || t >= t_max {
-                    return None;
-                }
-                let x = ray.origin.x + t * ray.direction.x;
-                let z = ray.origin.z + t * ray.direction.z;
-                if x < rect.x0 || x > rect.x1 || z < rect.z0 || z > rect.z1 {
-                    return None;
-                }
-                let point = ray.at(t);
-                Some(HitRecord::new(
-                    ray,
-                    t,
-                    point,
-                    Vec3::new(0.0, rect.normal_y, 0.0),
-                    rect.material,
-                ))
-            }
-            Self::YZ(rect) => {
-                if ray.direction.x.abs() < 1e-6 {
-                    return None;
-                }
-                let t = (rect.x - ray.origin.x) / ray.direction.x;
-                if t <= t_min || t >= t_max {
-                    return None;
-                }
-                let y = ray.origin.y + t * ray.direction.y;
-                let z = ray.origin.z + t * ray.direction.z;
-                if y < rect.y0 || y > rect.y1 || z < rect.z0 || z > rect.z1 {
-                    return None;
-                }
-                let point = ray.at(t);
-                Some(HitRecord::new(
-                    ray,
-                    t,
-                    point,
-                    Vec3::new(rect.normal_x, 0.0, 0.0),
-                    rect.material,
-                ))
-            }
-            Self::Sphere(sphere) => {
-                let oc = ray.origin - sphere.center;
-                let a = ray.direction.length_squared();
-                let half_b = oc.dot(ray.direction);
-                let c = oc.length_squared() - sphere.radius * sphere.radius;
-                let discriminant = half_b * half_b - a * c;
-                if discriminant < 0.0 {
-                    return None;
-                }
-
-                let sqrtd = discriminant.sqrt();
-                let mut t = (-half_b - sqrtd) / a;
-                if t <= t_min || t >= t_max {
-                    t = (-half_b + sqrtd) / a;
-                    if t <= t_min || t >= t_max {
-                        return None;
-                    }
-                }
-
-                let point = ray.at(t);
-                let outward_normal = (point - sphere.center) / sphere.radius;
-                Some(HitRecord::new(
-                    ray,
-                    t,
-                    point,
-                    outward_normal,
-                    sphere.material,
-                ))
-            }
-        }
-    }
-}
-
 struct Scene {
     objects: Vec<Primitive>,
-}
-
-impl Scene {
-    fn hit(&self, ray: &Ray, t_min: f32, t_max: f32) -> Option<HitRecord> {
-        let mut closest = t_max;
-        let mut hit = None;
-
-        for object in &self.objects {
-            if let Some(candidate) = object.hit(ray, t_min, closest) {
-                closest = candidate.t;
-                hit = Some(candidate);
-            }
-        }
-
-        hit
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -449,52 +220,365 @@ impl Camera {
             vertical,
         }
     }
+}
 
-    fn get_ray(self, s: f32, t: f32) -> Ray {
-        let dir = self.lower_left + self.horizontal * s + self.vertical * t - self.origin;
-        Ray::new(self.origin, dir)
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct GpuUniforms {
+    dims: [u32; 4],
+    frame: [u32; 4],
+    origin: [f32; 4],
+    lower_left: [f32; 4],
+    horizontal: [f32; 4],
+    vertical: [f32; 4],
+}
+
+impl GpuUniforms {
+    fn new(
+        width: u32,
+        height: u32,
+        primitive_count: u32,
+        sample_index: u32,
+        seed: u32,
+        camera: Camera,
+    ) -> Self {
+        Self {
+            dims: [width, height, primitive_count, MAX_BOUNCES],
+            frame: [sample_index, seed, 0, 0],
+            origin: [camera.origin.x, camera.origin.y, camera.origin.z, 0.0],
+            lower_left: [
+                camera.lower_left.x,
+                camera.lower_left.y,
+                camera.lower_left.z,
+                0.0,
+            ],
+            horizontal: [
+                camera.horizontal.x,
+                camera.horizontal.y,
+                camera.horizontal.z,
+                0.0,
+            ],
+            vertical: [camera.vertical.x, camera.vertical.y, camera.vertical.z, 0.0],
+        }
     }
 }
 
-#[derive(Clone, Copy)]
-struct TileSpec {
-    id: usize,
-    x0: usize,
-    x1: usize,
-    y0: usize,
-    y1: usize,
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct GpuPrimitive {
+    header: [u32; 4],
+    p0: [f32; 4],
+    p1: [f32; 4],
+    color: [f32; 4],
+    params: [f32; 4],
 }
 
-impl TileSpec {
-    fn width(self) -> usize {
-        self.x1.saturating_sub(self.x0)
+struct GpuPathTracer {
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
+    width: u32,
+    height: u32,
+    primitive_count: u32,
+    camera: Camera,
+    uniform_buffer: wgpu::Buffer,
+    _primitive_buffer: wgpu::Buffer,
+    _accumulation_buffer: wgpu::Buffer,
+    output_texture: wgpu::Texture,
+    _output_view: wgpu::TextureView,
+    readback_buffer: wgpu::Buffer,
+    padded_bytes_per_row: usize,
+    bind_group: wgpu::BindGroup,
+    compute_pipeline: wgpu::ComputePipeline,
+    sample_index: u32,
+    seed: u32,
+}
+
+impl GpuPathTracer {
+    fn new(
+        render_state: &eframe::egui_wgpu::RenderState,
+        width: u32,
+        height: u32,
+        scene: &Scene,
+        camera: Camera,
+    ) -> Result<Self, String> {
+        if width == 0 || height == 0 {
+            return Err("Image dimensions must be non-zero".to_owned());
+        }
+
+        let device = Arc::clone(&render_state.device);
+        let queue = Arc::clone(&render_state.queue);
+
+        let gpu_primitives: Vec<GpuPrimitive> = scene
+            .objects
+            .iter()
+            .copied()
+            .map(primitive_to_gpu)
+            .collect();
+
+        let primitive_count = u32::try_from(gpu_primitives.len())
+            .map_err(|_| "Scene has too many primitives for GPU uniforms".to_owned())?;
+        if primitive_count == 0 {
+            return Err("Scene has no primitives to render".to_owned());
+        }
+
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pathtracer-uniforms"),
+            size: std::mem::size_of::<GpuUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let primitive_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pathtracer-primitives"),
+            size: (gpu_primitives.len() * std::mem::size_of::<GpuPrimitive>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&primitive_buffer, 0, bytemuck::cast_slice(&gpu_primitives));
+
+        let pixel_count = width as u64 * height as u64;
+        let accumulation_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pathtracer-accumulation"),
+            size: pixel_count * std::mem::size_of::<[f32; 4]>() as u64,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        let output_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("pathtracer-output"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let output_view = output_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let padded_bytes_per_row = padded_bytes_per_row(width);
+        let readback_size = padded_bytes_per_row as u64 * height as u64;
+        let readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pathtracer-readback"),
+            size: readback_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("pathtracer-bind-group-layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("pathtracer-bind-group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: primitive_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: accumulation_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&output_view),
+                },
+            ],
+        });
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("pathtracer-wgsl"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("pathtracer.wgsl").into()),
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("pathtracer-pipeline-layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("pathtracer-compute"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: "main",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+
+        Ok(Self {
+            device,
+            queue,
+            width,
+            height,
+            primitive_count,
+            camera,
+            uniform_buffer,
+            _primitive_buffer: primitive_buffer,
+            _accumulation_buffer: accumulation_buffer,
+            output_texture,
+            _output_view: output_view,
+            readback_buffer,
+            padded_bytes_per_row,
+            bind_group,
+            compute_pipeline,
+            sample_index: 0,
+            seed: 0x1234_5678,
+        })
     }
 
-    fn height(self) -> usize {
-        self.y1.saturating_sub(self.y0)
+    fn render_sample(&mut self, output: &mut [u8]) -> Result<(), String> {
+        let expected_len = self.width as usize * self.height as usize * 4;
+        if output.len() != expected_len {
+            return Err(format!(
+                "RGBA output length mismatch: expected {expected_len}, got {}",
+                output.len()
+            ));
+        }
+
+        let uniforms = GpuUniforms::new(
+            self.width,
+            self.height,
+            self.primitive_count,
+            self.sample_index,
+            self.seed,
+            self.camera,
+        );
+        self.queue
+            .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("pathtracer-encoder"),
+            });
+
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("pathtracer-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.compute_pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.dispatch_workgroups(self.width.div_ceil(8), self.height.div_ceil(8), 1);
+        }
+
+        encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: &self.output_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &self.readback_buffer,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(self.padded_bytes_per_row as u32),
+                    rows_per_image: Some(self.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = self.readback_buffer.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+
+        let _ = self.device.poll(wgpu::Maintain::Wait);
+
+        let map_result = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|_| "Timed out waiting for GPU readback".to_owned())?;
+        map_result.map_err(|err| format!("GPU readback map failed: {err}"))?;
+
+        let data = slice.get_mapped_range();
+        let row_bytes = self.width as usize * 4;
+        for y in 0..self.height as usize {
+            let src_start = y * self.padded_bytes_per_row;
+            let dst_start = y * row_bytes;
+            output[dst_start..dst_start + row_bytes]
+                .copy_from_slice(&data[src_start..src_start + row_bytes]);
+        }
+        drop(data);
+        self.readback_buffer.unmap();
+
+        self.sample_index = self.sample_index.saturating_add(1);
+        self.seed = self
+            .seed
+            .wrapping_mul(1_664_525)
+            .wrapping_add(1_013_904_223);
+
+        Ok(())
     }
 
-    fn pixel_count(self) -> usize {
-        self.width() * self.height()
+    fn sample_count(&self) -> u32 {
+        self.sample_index
     }
-}
 
-struct TileData {
-    accum: Vec<Vec3>,
-    spp: u32,
-}
-
-struct SharedTile {
-    spec: TileSpec,
-    data: Mutex<TileData>,
-}
-
-struct SharedRenderer {
-    width: usize,
-    height: usize,
-    tiles: Vec<SharedTile>,
-    total_samples: AtomicU64,
-    started_at: Instant,
+    fn total_samples(&self) -> u64 {
+        self.sample_index as u64 * self.width as u64 * self.height as u64
+    }
 }
 
 struct SnapshotFrame {
@@ -504,72 +588,21 @@ struct SnapshotFrame {
 }
 
 struct PathTracerApp {
-    renderer: Arc<SharedRenderer>,
+    gpu: Option<GpuPathTracer>,
+    init_error: Option<String>,
     texture: Option<egui::TextureHandle>,
     rgba_buffer: Vec<u8>,
     stop_flag: Arc<AtomicBool>,
-    worker_threads: Vec<JoinHandle<()>>,
     snapshot_sender: Option<Sender<SnapshotFrame>>,
     snapshot_thread: Option<JoinHandle<()>>,
     last_snapshot: Instant,
     dump_interval: Duration,
-    core_count: usize,
+    started_at: Instant,
 }
 
 impl PathTracerApp {
-    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        let core_count = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
-
-        let tile_specs = build_vertical_tiles(IMAGE_WIDTH, IMAGE_HEIGHT, core_count);
-        let tiles = tile_specs
-            .iter()
-            .copied()
-            .map(|spec| SharedTile {
-                spec,
-                data: Mutex::new(TileData {
-                    accum: vec![Vec3::ZERO; spec.pixel_count()],
-                    spp: 0,
-                }),
-            })
-            .collect();
-
-        let renderer = Arc::new(SharedRenderer {
-            width: IMAGE_WIDTH,
-            height: IMAGE_HEIGHT,
-            tiles,
-            total_samples: AtomicU64::new(0),
-            started_at: Instant::now(),
-        });
-
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let stop_flag = Arc::new(AtomicBool::new(false));
-
-        let camera_origin = Vec3::new(0.5, 0.5, -2.2);
-        let camera_target = Vec3::new(0.5, 0.5, 0.5);
-
-        let scene = Arc::new(build_cornell_box_scene(camera_origin));
-        let camera = Camera::new(
-            camera_origin,
-            camera_target,
-            Vec3::new(0.0, 1.0, 0.0),
-            40.0,
-            IMAGE_WIDTH as f32 / IMAGE_HEIGHT as f32,
-        );
-
-        let mut worker_threads = Vec::with_capacity(tile_specs.len());
-        for spec in tile_specs {
-            let thread_renderer = Arc::clone(&renderer);
-            let thread_scene = Arc::clone(&scene);
-            let thread_stop = Arc::clone(&stop_flag);
-            let name = format!("render-tile-{}", spec.id);
-
-            if let Ok(handle) = thread::Builder::new().name(name).spawn(move || {
-                render_tile_loop(spec, thread_renderer, thread_scene, camera, thread_stop)
-            }) {
-                worker_threads.push(handle);
-            }
-        }
 
         let (snapshot_sender, snapshot_receiver) = bounded::<SnapshotFrame>(1);
         let snapshot_thread = {
@@ -581,25 +614,59 @@ impl PathTracerApp {
                 .ok()
         };
 
+        let camera_origin = Vec3::new(0.5, 0.5, -2.2);
+        let camera_target = Vec3::new(0.5, 0.5, 0.5);
+        let camera = Camera::new(
+            camera_origin,
+            camera_target,
+            Vec3::new(0.0, 1.0, 0.0),
+            40.0,
+            IMAGE_WIDTH as f32 / IMAGE_HEIGHT as f32,
+        );
+        let scene = build_cornell_box_scene(camera_origin);
+
+        let (gpu, init_error) = match cc.wgpu_render_state.as_ref() {
+            Some(render_state) => {
+                match GpuPathTracer::new(
+                    render_state,
+                    IMAGE_WIDTH as u32,
+                    IMAGE_HEIGHT as u32,
+                    &scene,
+                    camera,
+                ) {
+                    Ok(gpu) => (Some(gpu), None),
+                    Err(err) => (
+                        None,
+                        Some(format!("Failed to initialize GPU renderer: {err}")),
+                    ),
+                }
+            }
+            None => (
+                None,
+                Some(
+                    "WGPU render state is unavailable. Start eframe with Renderer::Wgpu."
+                        .to_owned(),
+                ),
+            ),
+        };
+
         Self {
-            renderer,
+            gpu,
+            init_error,
             texture: None,
             rgba_buffer: vec![0_u8; IMAGE_WIDTH * IMAGE_HEIGHT * 4],
             stop_flag,
-            worker_threads,
             snapshot_sender: Some(snapshot_sender),
             snapshot_thread,
             last_snapshot: Instant::now(),
             dump_interval: SNAPSHOT_INTERVAL,
-            core_count,
+            started_at: Instant::now(),
         }
     }
 
     fn refresh_texture(&mut self, ctx: &egui::Context) {
-        compose_rgba(&self.renderer, &mut self.rgba_buffer);
-
         let color_image = egui::ColorImage::from_rgba_unmultiplied(
-            [self.renderer.width, self.renderer.height],
+            [IMAGE_WIDTH, IMAGE_HEIGHT],
             &self.rgba_buffer,
         );
 
@@ -618,8 +685,8 @@ impl PathTracerApp {
 
         if let Some(sender) = &self.snapshot_sender {
             let frame = SnapshotFrame {
-                width: self.renderer.width as u32,
-                height: self.renderer.height as u32,
+                width: IMAGE_WIDTH as u32,
+                height: IMAGE_HEIGHT as u32,
                 pixels: self.rgba_buffer.clone(),
             };
             let _ = sender.try_send(frame);
@@ -631,37 +698,43 @@ impl PathTracerApp {
 
 impl eframe::App for PathTracerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.refresh_texture(ctx);
-        self.maybe_queue_snapshot();
+        if let Some(gpu) = &mut self.gpu {
+            if let Err(err) = gpu.render_sample(&mut self.rgba_buffer) {
+                self.init_error = Some(format!("GPU render failed: {err}"));
+                self.gpu = None;
+            } else {
+                self.refresh_texture(ctx);
+                self.maybe_queue_snapshot();
+            }
+        }
 
-        let elapsed = self.renderer.started_at.elapsed().as_secs_f32();
-        let total_samples = self.renderer.total_samples.load(Ordering::Relaxed);
-        let avg_spp = total_samples as f32 / (self.renderer.width * self.renderer.height) as f32;
-        let min_spp = min_tile_spp(&self.renderer);
+        let elapsed = self.started_at.elapsed().as_secs_f32();
+        let sample_count = self.gpu.as_ref().map_or(0, GpuPathTracer::sample_count);
+        let total_samples = self.gpu.as_ref().map_or(0, GpuPathTracer::total_samples);
 
         egui::TopBottomPanel::top("status").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.label(format!(
-                    "Resolution: {}x{}",
-                    self.renderer.width, self.renderer.height
-                ));
+                ui.label(format!("Resolution: {}x{}", IMAGE_WIDTH, IMAGE_HEIGHT));
                 ui.separator();
-                ui.label(format!("Threads/Tiles: {}", self.core_count));
+                ui.label("Backend: WGPU/WGSL");
                 ui.separator();
-                ui.label(format!("Avg spp: {:.2}", avg_spp));
+                ui.label(format!("Samples per pixel: {}", sample_count));
                 ui.separator();
-                ui.label(format!("Min tile spp: {}", min_spp));
+                ui.label(format!("Total samples: {}", total_samples));
                 ui.separator();
                 ui.label(format!("Elapsed: {:.1}s", elapsed));
                 ui.separator();
                 ui.label(format!("Snapshot: {}", SNAPSHOT_FILE));
             });
+
+            if let Some(err) = &self.init_error {
+                ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
+            }
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(texture) = &self.texture {
-                let image_size =
-                    egui::vec2(self.renderer.width as f32, self.renderer.height as f32);
+                let image_size = egui::vec2(IMAGE_WIDTH as f32, IMAGE_HEIGHT as f32);
                 let avail = ui.available_size();
                 let scale = (avail.x / image_size.x)
                     .min(avail.y / image_size.y)
@@ -670,6 +743,10 @@ impl eframe::App for PathTracerApp {
 
                 ui.centered_and_justified(|ui| {
                     ui.add(egui::Image::new(texture).fit_to_exact_size(desired));
+                });
+            } else {
+                ui.centered_and_justified(|ui| {
+                    ui.label("Waiting for GPU output...");
                 });
             }
         });
@@ -683,33 +760,95 @@ impl Drop for PathTracerApp {
         self.stop_flag.store(true, Ordering::SeqCst);
         self.snapshot_sender.take();
 
-        for handle in self.worker_threads.drain(..) {
-            let _ = handle.join();
-        }
-
         if let Some(handle) = self.snapshot_thread.take() {
             let _ = handle.join();
         }
     }
 }
 
-fn build_vertical_tiles(width: usize, height: usize, count: usize) -> Vec<TileSpec> {
-    let tile_count = count.max(1);
-    let mut tiles = Vec::with_capacity(tile_count);
-
-    for id in 0..tile_count {
-        let x0 = id * width / tile_count;
-        let x1 = (id + 1) * width / tile_count;
-        tiles.push(TileSpec {
-            id,
-            x0,
-            x1,
-            y0: 0,
-            y1: height,
-        });
+fn material_to_gpu(material: Material) -> (u32, [f32; 4], [f32; 4]) {
+    match material {
+        Material::Diffuse { albedo } => (
+            MATERIAL_DIFFUSE,
+            [albedo.x, albedo.y, albedo.z, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+        ),
+        Material::Metal { albedo, fuzz } => (
+            MATERIAL_METAL,
+            [albedo.x, albedo.y, albedo.z, 0.0],
+            [fuzz, 0.0, 0.0, 0.0],
+        ),
+        Material::Glossy {
+            albedo,
+            roughness,
+            reflectivity,
+        } => (
+            MATERIAL_GLOSSY,
+            [albedo.x, albedo.y, albedo.z, 0.0],
+            [roughness, reflectivity, 0.0, 0.0],
+        ),
+        Material::Emissive { color } => (
+            MATERIAL_EMISSIVE,
+            [color.x, color.y, color.z, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+        ),
     }
+}
 
-    tiles
+fn primitive_to_gpu(primitive: Primitive) -> GpuPrimitive {
+    match primitive {
+        Primitive::XY(rect) => {
+            let (material_kind, color, params) = material_to_gpu(rect.material);
+            GpuPrimitive {
+                header: [PRIMITIVE_XY, material_kind, 0, 0],
+                p0: [rect.x0, rect.x1, rect.y0, rect.y1],
+                p1: [rect.z, rect.normal_z, 0.0, 0.0],
+                color,
+                params,
+            }
+        }
+        Primitive::XZ(rect) => {
+            let (material_kind, color, params) = material_to_gpu(rect.material);
+            GpuPrimitive {
+                header: [PRIMITIVE_XZ, material_kind, 0, 0],
+                p0: [rect.x0, rect.x1, rect.z0, rect.z1],
+                p1: [rect.y, rect.normal_y, 0.0, 0.0],
+                color,
+                params,
+            }
+        }
+        Primitive::YZ(rect) => {
+            let (material_kind, color, params) = material_to_gpu(rect.material);
+            GpuPrimitive {
+                header: [PRIMITIVE_YZ, material_kind, 0, 0],
+                p0: [rect.y0, rect.y1, rect.z0, rect.z1],
+                p1: [rect.x, rect.normal_x, 0.0, 0.0],
+                color,
+                params,
+            }
+        }
+        Primitive::Sphere(sphere) => {
+            let (material_kind, color, params) = material_to_gpu(sphere.material);
+            GpuPrimitive {
+                header: [PRIMITIVE_SPHERE, material_kind, 0, 0],
+                p0: [
+                    sphere.center.x,
+                    sphere.center.y,
+                    sphere.center.z,
+                    sphere.radius,
+                ],
+                p1: [0.0, 0.0, 0.0, 0.0],
+                color,
+                params,
+            }
+        }
+    }
+}
+
+fn padded_bytes_per_row(width: u32) -> usize {
+    let row_bytes = width as usize * 4;
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
+    (row_bytes + align - 1) / align * align
 }
 
 fn build_cornell_box_scene(camera_origin: Vec3) -> Scene {
@@ -1003,6 +1142,7 @@ fn add_rubber_duck(
     add_sphere(objects, eye_base + right * 0.012, 0.0045, eye);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn add_slowpoke(
     objects: &mut Vec<Primitive>,
     floor_anchor: Vec3,
@@ -1144,208 +1284,6 @@ fn add_slowpoke(
     );
 }
 
-fn render_tile_loop(
-    spec: TileSpec,
-    renderer: Arc<SharedRenderer>,
-    scene: Arc<Scene>,
-    camera: Camera,
-    stop_flag: Arc<AtomicBool>,
-) {
-    let tile_width = spec.width();
-    let tile_height = spec.height();
-
-    if tile_width == 0 || tile_height == 0 {
-        while !stop_flag.load(Ordering::Relaxed) {
-            thread::sleep(Duration::from_millis(50));
-        }
-        return;
-    }
-
-    let mut rng = SmallRng::from_entropy();
-    let mut pass_buffer = vec![Vec3::ZERO; tile_width * tile_height];
-
-    'render: while !stop_flag.load(Ordering::Relaxed) {
-        for local_y in 0..tile_height {
-            let y = spec.y0 + local_y;
-            for local_x in 0..tile_width {
-                if stop_flag.load(Ordering::Relaxed) {
-                    break 'render;
-                }
-
-                let x = spec.x0 + local_x;
-                let idx = local_y * tile_width + local_x;
-                pass_buffer[idx] = sample_pixel(
-                    x,
-                    y,
-                    renderer.width,
-                    renderer.height,
-                    camera,
-                    scene.as_ref(),
-                    &mut rng,
-                );
-            }
-        }
-
-        let mut tile = renderer.tiles[spec.id].data.lock();
-        for (accum, sample) in tile.accum.iter_mut().zip(pass_buffer.iter()) {
-            *accum += *sample;
-        }
-        tile.spp = tile.spp.saturating_add(1);
-        drop(tile);
-
-        renderer
-            .total_samples
-            .fetch_add((tile_width * tile_height) as u64, Ordering::Relaxed);
-    }
-}
-
-fn sample_pixel(
-    x: usize,
-    y: usize,
-    width: usize,
-    height: usize,
-    camera: Camera,
-    scene: &Scene,
-    rng: &mut SmallRng,
-) -> Vec3 {
-    let w = (width.saturating_sub(1)).max(1) as f32;
-    let h = (height.saturating_sub(1)).max(1) as f32;
-
-    let u = (x as f32 + rng.gen::<f32>()) / w;
-    let v = ((height - 1 - y) as f32 + rng.gen::<f32>()) / h;
-
-    let ray = camera.get_ray(u, v);
-    trace_ray(ray, scene, rng)
-}
-
-fn trace_ray(mut ray: Ray, scene: &Scene, rng: &mut SmallRng) -> Vec3 {
-    let mut throughput = Vec3::splat(1.0);
-    let mut radiance = Vec3::ZERO;
-
-    for bounce in 0..MAX_BOUNCES {
-        if let Some(hit) = scene.hit(&ray, 0.001, f32::INFINITY) {
-            radiance += throughput.mul_elem(hit.material.emitted());
-
-            if let Some((scattered, attenuation)) = hit.material.scatter(&ray, &hit, rng) {
-                throughput = throughput.mul_elem(attenuation);
-
-                if bounce >= 3 {
-                    let survive_probability = throughput.max_component().clamp(0.05, 0.95);
-                    if rng.gen::<f32>() > survive_probability {
-                        break;
-                    }
-                    throughput /= survive_probability;
-                }
-
-                ray = scattered;
-            } else {
-                break;
-            }
-        } else {
-            break;
-        }
-    }
-
-    radiance
-}
-
-fn reflect(v: Vec3, n: Vec3) -> Vec3 {
-    v - n * (2.0 * v.dot(n))
-}
-
-fn random_in_unit_sphere(rng: &mut SmallRng) -> Vec3 {
-    loop {
-        let p = Vec3::new(
-            rng.gen_range(-1.0..1.0),
-            rng.gen_range(-1.0..1.0),
-            rng.gen_range(-1.0..1.0),
-        );
-        if p.length_squared() < 1.0 {
-            return p;
-        }
-    }
-}
-
-fn cosine_hemisphere(normal: Vec3, rng: &mut SmallRng) -> Vec3 {
-    let r1 = rng.gen::<f32>();
-    let r2 = rng.gen::<f32>();
-    let phi = 2.0 * std::f32::consts::PI * r1;
-
-    let x = phi.cos() * r2.sqrt();
-    let y = phi.sin() * r2.sqrt();
-    let z = (1.0 - r2).sqrt();
-
-    let w = normal.normalized();
-    let a = if w.x.abs() > 0.9 {
-        Vec3::new(0.0, 1.0, 0.0)
-    } else {
-        Vec3::new(1.0, 0.0, 0.0)
-    };
-    let v = w.cross(a).normalized();
-    let u = v.cross(w);
-
-    (u * x + v * y + w * z).normalized()
-}
-
-fn compose_rgba(renderer: &SharedRenderer, output: &mut [u8]) {
-    for tile in &renderer.tiles {
-        let Some(data) = tile.data.try_lock() else {
-            continue;
-        };
-
-        let spp = data.spp;
-        let inv_spp = if spp > 0 { 1.0 / spp as f32 } else { 0.0 };
-        let tile_width = tile.spec.width();
-        let tile_height = tile.spec.height();
-
-        for local_y in 0..tile_height {
-            let y = tile.spec.y0 + local_y;
-            for local_x in 0..tile_width {
-                let x = tile.spec.x0 + local_x;
-                let idx = local_y * tile_width + local_x;
-
-                let linear = data.accum[idx] * inv_spp;
-                let rgba = linear_to_rgba(linear);
-                let out_idx = (y * renderer.width + x) * 4;
-                output[out_idx] = rgba[0];
-                output[out_idx + 1] = rgba[1];
-                output[out_idx + 2] = rgba[2];
-                output[out_idx + 3] = 255;
-            }
-        }
-    }
-}
-
-fn min_tile_spp(renderer: &SharedRenderer) -> u32 {
-    renderer
-        .tiles
-        .iter()
-        .filter_map(|tile| tile.data.try_lock().map(|guard| guard.spp))
-        .min()
-        .unwrap_or(0)
-}
-
-fn linear_to_rgba(color: Vec3) -> [u8; 4] {
-    let mapped = Vec3::new(
-        color.x.max(0.0) / (1.0 + color.x.max(0.0)),
-        color.y.max(0.0) / (1.0 + color.y.max(0.0)),
-        color.z.max(0.0) / (1.0 + color.z.max(0.0)),
-    );
-
-    let gamma = Vec3::new(
-        mapped.x.powf(1.0 / 2.2),
-        mapped.y.powf(1.0 / 2.2),
-        mapped.z.powf(1.0 / 2.2),
-    );
-
-    [
-        (gamma.x.clamp(0.0, 0.999) * 256.0) as u8,
-        (gamma.y.clamp(0.0, 0.999) * 256.0) as u8,
-        (gamma.z.clamp(0.0, 0.999) * 256.0) as u8,
-        255,
-    ]
-}
-
 fn snapshot_writer_loop(
     receiver: Receiver<SnapshotFrame>,
     stop_flag: Arc<AtomicBool>,
@@ -1370,6 +1308,7 @@ fn snapshot_writer_loop(
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
+        renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default()
             .with_title("Cornell Box Path Tracer")
             .with_inner_size([980.0, 860.0]),
