@@ -34,8 +34,8 @@ const SNAPSHOT_FILE: &str = "snapshot.png";
 const CAMERA_MOVE_SPEED: f32 = 1.8;
 const CAMERA_LOOK_SENSITIVITY: f32 = 0.0028;
 const TOUCH_LOOK_SENSITIVITY: f32 = 0.0034;
-const TOUCH_PINCH_MOVE_SCALE: f32 = 0.12;
-const TOUCH_PINCH_MAX_STEP: f32 = 0.035;
+const TOUCH_PINCH_MOVE_SCALE: f32 = 0.48;
+const TOUCH_PINCH_MAX_STEP: f32 = 0.14;
 const CAMERA_IDLE_TO_PATH: Duration = Duration::from_secs(1);
 
 #[cfg(target_arch = "wasm32")]
