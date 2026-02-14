@@ -3,7 +3,7 @@ Guidance for coding agents working in this repository.
 
 ## Scope
 - Applies to the whole repo (`/Users/ripopov/work/rust/open-codex`).
-- Project type: Rust binary crate with `eframe` + `wgpu` + WGSL compute shader.
+- Project type: Rust binary crate with `eframe` + `wgpu` + WGSL compute shader targeting native desktop and `wasm32` web.
 - Primary sources: `src/main.rs` and `src/pathtracer.wgsl`.
 
 ## Cursor / Copilot Rule Sources
@@ -15,6 +15,8 @@ Guidance for coding agents working in this repository.
 ## Repository Layout
 - `src/main.rs`: app bootstrap, scene building, camera controls, GPU orchestration.
 - `src/pathtracer.wgsl`: path tracer + fast raytracer shader logic.
+- `web/index.html`: browser host page and wasm bootstrapping logic.
+- `web/pkg/`: generated wasm-bindgen artifacts (ignored by git).
 - `snapshot.png`: runtime output image (ignored by git).
 - `target/`: build artifacts (ignored by git).
 
@@ -22,7 +24,10 @@ Guidance for coding agents working in this repository.
 - Rust edition: 2021.
 - Build tool: Cargo.
 - Rendering backend: WGPU.
+- Browser target: `wasm32-unknown-unknown`.
+- Browser packaging: `wasm-bindgen` CLI output to `web/pkg/`.
 - Runtime smoke tests require a working graphics environment.
+- Browser smoke tests require a WebGPU-capable browser (Chrome with hardware acceleration enabled).
 
 ## Build / Run / Lint / Test Commands
 
@@ -32,6 +37,15 @@ Guidance for coding agents working in this repository.
 - Debug run: `cargo run`
 - Release build: `cargo build --release`
 - Release run: `cargo run --release`
+
+### Browser (WASM)
+- Install target (one-time): `rustup target add wasm32-unknown-unknown`
+- Type-check wasm target: `cargo check --target wasm32-unknown-unknown`
+- Build wasm release: `cargo build --target wasm32-unknown-unknown --release`
+- Generate web bindings:
+  - `wasm-bindgen --target web --out-dir web/pkg target/wasm32-unknown-unknown/release/cornell_egui_pathtracer.wasm`
+- Serve web root locally: `python3 -m http.server 8080 --directory web`
+- Open in Chrome: `open -a "Google Chrome" "http://127.0.0.1:8080"`
 
 ### Formatting
 - Format all Rust code: `cargo fmt`
@@ -60,6 +74,8 @@ Guidance for coding agents working in this repository.
 - Code only (no shader logic): `cargo fmt -- --check && cargo check`
 - CPU logic + tests: `cargo fmt -- --check && cargo test`
 - Renderer or WGSL edits: `cargo check && cargo run`
+- Browser-target edits: `cargo check --target wasm32-unknown-unknown`
+- Browser runtime edits: `cargo build --target wasm32-unknown-unknown --release && wasm-bindgen --target web --out-dir web/pkg target/wasm32-unknown-unknown/release/cornell_egui_pathtracer.wasm`
 - Pre-PR sanity: `cargo fmt -- --check && cargo clippy --all-targets --all-features`
 
 ## Recommended Agent Workflow
@@ -67,7 +83,11 @@ Guidance for coding agents working in this repository.
 - Keep diffs focused; avoid unrelated refactors.
 - Run `cargo fmt` after Rust edits.
 - Run `cargo check` after any non-trivial change.
+- For web-target changes, run `cargo check --target wasm32-unknown-unknown`.
+- For browser startup/runtime fixes, regenerate `web/pkg` and validate via local server in Chrome.
 - If shader/render flow changed, run `cargo run` for a visual smoke test.
+- When browser changes are not reflected, use a hard refresh or cache-busted URL.
+- Do not commit generated `web/pkg` artifacts.
 - Do not revert unrelated user changes in the working tree.
 
 ## Rust Style Guidelines
@@ -94,6 +114,12 @@ Guidance for coding agents working in this repository.
 - Prefer `f32` for renderer math unless precision needs force otherwise.
 - Use `saturating_*`, `wrapping_*`, or checked math when overflow behavior matters.
 - Clamp and epsilon-check float math in camera/intersection logic.
+- Be careful with time arithmetic on wasm; prefer checked operations when subtracting durations.
+
+### Native vs Web Runtime
+- Use `std::time::Instant` on native targets and `web_time::Instant` on `wasm32`.
+- Avoid assumptions about filesystem/background threads on wasm paths.
+- Keep snapshot writing disabled on browser target unless explicit web storage support is added.
 
 ### GPU Boundary Rules
 - Keep Rust/WGSL constants in sync (primitive/material/render-mode IDs).
@@ -134,6 +160,10 @@ Guidance for coding agents working in this repository.
   - `cargo check`
   - `cargo clippy --all-targets --all-features`
   - `cargo run` visual verification
+- For browser features, validate with:
+  - `cargo check --target wasm32-unknown-unknown`
+  - wasm release build + `wasm-bindgen`
+  - local web server + Chrome smoke run
 - If adding tests, include single-test invocation examples in PR notes.
 
 ## Commit and Change Hygiene
@@ -144,6 +174,8 @@ Guidance for coding agents working in this repository.
 ## Agent Completion Checklist
 - Formatting done (`cargo fmt`).
 - Build check done (`cargo check`).
+- For web edits: wasm build check done (`cargo check --target wasm32-unknown-unknown`).
 - Lint status reported (pass or known warnings/failures).
 - Runtime smoke test done for shader/render-loop edits.
+- Browser smoke test done for wasm/web edits.
 - Any limitations and follow-up work documented clearly.
