@@ -283,10 +283,18 @@ struct RectYZ {
 }
 
 #[derive(Clone, Copy)]
+struct Sphere {
+    center: Vec3,
+    radius: f32,
+    material: Material,
+}
+
+#[derive(Clone, Copy)]
 enum Primitive {
     XY(RectXY),
     XZ(RectXZ),
     YZ(RectYZ),
+    Sphere(Sphere),
 }
 
 impl Primitive {
@@ -356,6 +364,35 @@ impl Primitive {
                     point,
                     Vec3::new(rect.normal_x, 0.0, 0.0),
                     rect.material,
+                ))
+            }
+            Self::Sphere(sphere) => {
+                let oc = ray.origin - sphere.center;
+                let a = ray.direction.length_squared();
+                let half_b = oc.dot(ray.direction);
+                let c = oc.length_squared() - sphere.radius * sphere.radius;
+                let discriminant = half_b * half_b - a * c;
+                if discriminant < 0.0 {
+                    return None;
+                }
+
+                let sqrtd = discriminant.sqrt();
+                let mut t = (-half_b - sqrtd) / a;
+                if t <= t_min || t >= t_max {
+                    t = (-half_b + sqrtd) / a;
+                    if t <= t_min || t >= t_max {
+                        return None;
+                    }
+                }
+
+                let point = ray.at(t);
+                let outward_normal = (point - sphere.center) / sphere.radius;
+                Some(HitRecord::new(
+                    ray,
+                    t,
+                    point,
+                    outward_normal,
+                    sphere.material,
                 ))
             }
         }
@@ -508,10 +545,13 @@ impl PathTracerApp {
 
         let stop_flag = Arc::new(AtomicBool::new(false));
 
-        let scene = Arc::new(build_cornell_box_scene());
+        let camera_origin = Vec3::new(0.5, 0.5, -2.2);
+        let camera_target = Vec3::new(0.5, 0.5, 0.5);
+
+        let scene = Arc::new(build_cornell_box_scene(camera_origin));
         let camera = Camera::new(
-            Vec3::new(0.5, 0.5, -2.2),
-            Vec3::new(0.5, 0.5, 0.5),
+            camera_origin,
+            camera_target,
             Vec3::new(0.0, 1.0, 0.0),
             40.0,
             IMAGE_WIDTH as f32 / IMAGE_HEIGHT as f32,
@@ -672,7 +712,7 @@ fn build_vertical_tiles(width: usize, height: usize, count: usize) -> Vec<TileSp
     tiles
 }
 
-fn build_cornell_box_scene() -> Scene {
+fn build_cornell_box_scene(camera_origin: Vec3) -> Scene {
     let mut objects = Vec::new();
 
     let white = Material::Diffuse {
@@ -697,6 +737,38 @@ fn build_cornell_box_scene() -> Scene {
     };
     let light = Material::Emissive {
         color: Vec3::splat(15.0),
+    };
+    let duck_yellow = Material::Glossy {
+        albedo: Vec3::new(0.92, 0.82, 0.16),
+        roughness: 0.2,
+        reflectivity: 0.14,
+    };
+    let duck_orange = Material::Glossy {
+        albedo: Vec3::new(0.96, 0.5, 0.1),
+        roughness: 0.24,
+        reflectivity: 0.08,
+    };
+    let duck_eye = Material::Diffuse {
+        albedo: Vec3::splat(0.03),
+    };
+    let slowpoke_pink = Material::Glossy {
+        albedo: Vec3::new(0.9, 0.63, 0.72),
+        roughness: 0.3,
+        reflectivity: 0.08,
+    };
+    let slowpoke_muzzle = Material::Diffuse {
+        albedo: Vec3::new(0.97, 0.89, 0.86),
+    };
+    let slowpoke_eye_white = Material::Diffuse {
+        albedo: Vec3::new(0.97, 0.97, 0.97),
+    };
+    let slowpoke_detail = Material::Diffuse {
+        albedo: Vec3::new(0.05, 0.03, 0.03),
+    };
+    let slowpoke_tail_tip = Material::Glossy {
+        albedo: Vec3::new(0.94, 0.93, 0.93),
+        roughness: 0.22,
+        reflectivity: 0.06,
     };
 
     objects.push(Primitive::YZ(RectYZ {
@@ -772,6 +844,26 @@ fn build_cornell_box_scene() -> Scene {
         glossy_box_b,
     );
 
+    add_rubber_duck(
+        &mut objects,
+        Vec3::new(0.72, 0.69, 0.41),
+        camera_origin,
+        duck_yellow,
+        duck_orange,
+        duck_eye,
+    );
+
+    add_slowpoke(
+        &mut objects,
+        Vec3::new(0.30, 0.0, 0.20),
+        camera_origin,
+        slowpoke_pink,
+        slowpoke_muzzle,
+        slowpoke_eye_white,
+        slowpoke_detail,
+        slowpoke_tail_tip,
+    );
+
     Scene { objects }
 }
 
@@ -830,6 +922,226 @@ fn add_axis_aligned_box(objects: &mut Vec<Primitive>, min: Vec3, max: Vec3, mate
         normal_x: -1.0,
         material,
     }));
+}
+
+fn add_sphere(objects: &mut Vec<Primitive>, center: Vec3, radius: f32, material: Material) {
+    objects.push(Primitive::Sphere(Sphere {
+        center,
+        radius,
+        material,
+    }));
+}
+
+fn add_rubber_duck(
+    objects: &mut Vec<Primitive>,
+    perch: Vec3,
+    camera_origin: Vec3,
+    yellow: Material,
+    orange: Material,
+    eye: Material,
+) {
+    let body_radius = 0.058;
+    let body_center = Vec3::new(perch.x, perch.y + body_radius + 0.0015, perch.z);
+
+    let to_camera = (camera_origin - body_center).normalized();
+    let forward = Vec3::new(to_camera.x, to_camera.y * 0.35, to_camera.z).normalized();
+
+    let world_up = Vec3::new(0.0, 1.0, 0.0);
+    let mut right = forward.cross(world_up);
+    if right.length_squared() < 1e-6 {
+        right = Vec3::new(1.0, 0.0, 0.0);
+    }
+    right = right.normalized();
+    let up = right.cross(forward).normalized();
+
+    add_sphere(objects, body_center, body_radius, yellow);
+    add_sphere(
+        objects,
+        body_center + forward * 0.026 + up * 0.01,
+        0.048,
+        yellow,
+    );
+    add_sphere(
+        objects,
+        body_center - forward * 0.052 + up * 0.014,
+        0.021,
+        yellow,
+    );
+    add_sphere(
+        objects,
+        body_center - right * 0.045 + up * 0.009,
+        0.021,
+        yellow,
+    );
+    add_sphere(
+        objects,
+        body_center + right * 0.045 + up * 0.009,
+        0.021,
+        yellow,
+    );
+
+    let head_center = body_center + forward * 0.054 + up * 0.062;
+    add_sphere(objects, head_center, 0.034, yellow);
+    add_sphere(
+        objects,
+        head_center + forward * 0.014 + up * 0.001,
+        0.023,
+        yellow,
+    );
+
+    let beak_center = head_center + forward * 0.038 - up * 0.005;
+    add_sphere(objects, beak_center, 0.013, orange);
+    add_sphere(
+        objects,
+        beak_center + forward * 0.007 - up * 0.01,
+        0.0105,
+        orange,
+    );
+
+    let eye_base = head_center + forward * 0.026 + up * 0.01;
+    add_sphere(objects, eye_base - right * 0.012, 0.0045, eye);
+    add_sphere(objects, eye_base + right * 0.012, 0.0045, eye);
+}
+
+fn add_slowpoke(
+    objects: &mut Vec<Primitive>,
+    floor_anchor: Vec3,
+    camera_origin: Vec3,
+    pink: Material,
+    muzzle: Material,
+    eye_white: Material,
+    detail: Material,
+    tail_tip: Material,
+) {
+    let world_up = Vec3::new(0.0, 1.0, 0.0);
+    let scale = 1.65;
+    let body_radius = 0.105 * scale;
+    let body_center = Vec3::new(
+        floor_anchor.x,
+        floor_anchor.y + body_radius + 0.0015,
+        floor_anchor.z,
+    );
+
+    let to_camera = (camera_origin - body_center).normalized();
+    let face_dir = Vec3::new(to_camera.x, to_camera.y * 0.2, to_camera.z).normalized();
+
+    let mut side_hint = world_up.cross(face_dir);
+    if side_hint.length_squared() < 1e-6 {
+        side_hint = Vec3::new(1.0, 0.0, 0.0);
+    }
+    side_hint = side_hint.normalized();
+
+    let forward = (face_dir * 0.9 + side_hint * 0.435).normalized();
+
+    let mut right = forward.cross(world_up);
+    if right.length_squared() < 1e-6 {
+        right = Vec3::new(1.0, 0.0, 0.0);
+    }
+    right = right.normalized();
+    let up = right.cross(forward).normalized();
+
+    add_sphere(objects, body_center, body_radius, pink);
+    add_sphere(
+        objects,
+        body_center - forward * (0.012 * scale) + up * (0.006 * scale),
+        0.092 * scale,
+        pink,
+    );
+
+    let leg_radius = 0.033 * scale;
+    let leg_y = floor_anchor.y + leg_radius + 0.001;
+    let leg_drop = body_center.y - leg_y;
+
+    add_sphere(
+        objects,
+        body_center + forward * (0.046 * scale) - right * (0.056 * scale) - world_up * leg_drop,
+        leg_radius,
+        pink,
+    );
+    add_sphere(
+        objects,
+        body_center + forward * (0.046 * scale) + right * (0.056 * scale) - world_up * leg_drop,
+        leg_radius,
+        pink,
+    );
+    add_sphere(
+        objects,
+        body_center - forward * (0.039 * scale) - right * (0.058 * scale) - world_up * leg_drop,
+        leg_radius,
+        pink,
+    );
+    add_sphere(
+        objects,
+        body_center - forward * (0.039 * scale) + right * (0.058 * scale) - world_up * leg_drop,
+        leg_radius,
+        pink,
+    );
+
+    let head_center = body_center + forward * (0.095 * scale) + up * (0.01 * scale);
+    add_sphere(objects, head_center, 0.074 * scale, pink);
+
+    let snout_center = head_center + forward * (0.067 * scale) - up * (0.008 * scale);
+    add_sphere(objects, snout_center, 0.042 * scale, muzzle);
+    add_sphere(
+        objects,
+        snout_center + forward * (0.03 * scale) - up * (0.002 * scale),
+        0.009 * scale,
+        detail,
+    );
+
+    let eye_base = head_center + forward * (0.052 * scale) + up * (0.024 * scale);
+    let eye_offset = right * (0.026 * scale);
+    let pupil_shift = forward * (0.008 * scale) - up * (0.001 * scale);
+    add_sphere(objects, eye_base - eye_offset, 0.012 * scale, eye_white);
+    add_sphere(objects, eye_base + eye_offset, 0.012 * scale, eye_white);
+    add_sphere(
+        objects,
+        eye_base - eye_offset + pupil_shift,
+        0.0055 * scale,
+        detail,
+    );
+    add_sphere(
+        objects,
+        eye_base + eye_offset + pupil_shift,
+        0.0055 * scale,
+        detail,
+    );
+
+    let ear_base = head_center + up * (0.048 * scale);
+    add_sphere(
+        objects,
+        ear_base - right * (0.03 * scale) + forward * (0.004 * scale),
+        0.019 * scale,
+        pink,
+    );
+    add_sphere(
+        objects,
+        ear_base + right * (0.03 * scale) + forward * (0.004 * scale),
+        0.019 * scale,
+        pink,
+    );
+
+    let tail_base =
+        body_center - forward * (0.102 * scale) + up * (0.028 * scale) + right * (0.01 * scale);
+    add_sphere(objects, tail_base, 0.038 * scale, pink);
+    add_sphere(
+        objects,
+        tail_base - forward * (0.038 * scale) + up * (0.034 * scale) + right * (0.012 * scale),
+        0.032 * scale,
+        pink,
+    );
+    add_sphere(
+        objects,
+        tail_base - forward * (0.066 * scale) + up * (0.067 * scale) + right * (0.024 * scale),
+        0.026 * scale,
+        pink,
+    );
+    add_sphere(
+        objects,
+        tail_base - forward * (0.084 * scale) + up * (0.099 * scale) + right * (0.036 * scale),
+        0.021 * scale,
+        tail_tip,
+    );
 }
 
 fn render_tile_loop(
