@@ -33,7 +33,8 @@ const SNAPSHOT_FILE: &str = "snapshot.png";
 const CAMERA_MOVE_SPEED: f32 = 1.8;
 const CAMERA_LOOK_SENSITIVITY: f32 = 0.0028;
 const TOUCH_LOOK_SENSITIVITY: f32 = 0.0034;
-const TOUCH_PINCH_MOVE_SCALE: f32 = 1.2;
+const TOUCH_PINCH_MOVE_SCALE: f32 = 0.12;
+const TOUCH_PINCH_MAX_STEP: f32 = 0.035;
 const CAMERA_IDLE_TO_PATH: Duration = Duration::from_secs(1);
 
 #[cfg(target_arch = "wasm32")]
@@ -355,8 +356,13 @@ impl FpsCamera {
             } else {
                 TOUCH_LOOK_SENSITIVITY
             };
+            let pitch_delta = if right_mouse_down {
+                -pointer_delta.y * look_sensitivity
+            } else {
+                pointer_delta.y * look_sensitivity
+            };
             self.yaw += pointer_delta.x * look_sensitivity;
-            self.pitch = (self.pitch - pointer_delta.y * look_sensitivity).clamp(-1.52, 1.52);
+            self.pitch = (self.pitch + pitch_delta).clamp(-1.52, 1.52);
             changed = true;
         }
 
@@ -398,8 +404,9 @@ impl FpsCamera {
         if let Some(zoom_delta) = touch_pinch_zoom {
             let pinch_delta = zoom_delta.max(1e-4).ln();
             if pinch_delta.abs() > 1e-4 {
-                self.position =
-                    self.position + horizontal_forward * (pinch_delta * TOUCH_PINCH_MOVE_SCALE);
+                let pinch_move = (pinch_delta * TOUCH_PINCH_MOVE_SCALE)
+                    .clamp(-TOUCH_PINCH_MAX_STEP, TOUCH_PINCH_MAX_STEP);
+                self.position = self.position + horizontal_forward * pinch_move;
                 changed = true;
             }
         }
