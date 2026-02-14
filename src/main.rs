@@ -1,6 +1,7 @@
 use bytemuck::{Pod, Zeroable};
 use crossbeam_channel::Sender;
 use eframe::{egui, wgpu};
+use std::collections::BTreeSet;
 use std::ops::{Add, Div, Mul, Neg, Sub};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -283,6 +284,7 @@ struct FpsCamera {
     pitch: f32,
     fov_degrees: f32,
     aspect: f32,
+    active_touch_ids: BTreeSet<egui::TouchId>,
 }
 
 impl FpsCamera {
@@ -297,6 +299,7 @@ impl FpsCamera {
             pitch,
             fov_degrees,
             aspect,
+            active_touch_ids: BTreeSet::new(),
         }
     }
 
@@ -325,8 +328,9 @@ impl FpsCamera {
         let (
             pointer_delta,
             right_mouse_down,
-            touch_look_active,
             touch_pinch_zoom,
+            any_touches,
+            touch_events,
             boost,
             move_forward,
             move_back,
@@ -334,11 +338,23 @@ impl FpsCamera {
             move_right,
         ) = ctx.input(|input| {
             let multi_touch = input.multi_touch();
+            let touch_events = input
+                .events
+                .iter()
+                .filter_map(|event| {
+                    if let egui::Event::Touch { id, phase, .. } = event {
+                        Some((*id, *phase))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
             (
                 input.pointer.delta(),
                 input.pointer.button_down(egui::PointerButton::Secondary),
-                input.any_touches() && multi_touch.is_none(),
                 multi_touch.map(|touch| touch.zoom_delta),
+                input.any_touches(),
+                touch_events,
                 input.modifiers.shift,
                 input.key_down(egui::Key::W),
                 input.key_down(egui::Key::S),
@@ -346,6 +362,28 @@ impl FpsCamera {
                 input.key_down(egui::Key::D),
             )
         });
+
+        for (touch_id, phase) in touch_events {
+            match phase {
+                egui::TouchPhase::Start | egui::TouchPhase::Move => {
+                    self.active_touch_ids.insert(touch_id);
+                }
+                egui::TouchPhase::End | egui::TouchPhase::Cancel => {
+                    self.active_touch_ids.remove(&touch_id);
+                }
+            }
+        }
+
+        if !any_touches {
+            self.active_touch_ids.clear();
+        }
+
+        let mut touch_count = self.active_touch_ids.len();
+        if any_touches && touch_count == 0 {
+            touch_count = if touch_pinch_zoom.is_some() { 2 } else { 1 };
+        }
+        let touch_look_active = touch_count == 1;
+        let touch_pinch_active = touch_count >= 2;
 
         let mut changed = false;
         if (right_mouse_down || touch_look_active)
@@ -401,13 +439,15 @@ impl FpsCamera {
             changed = true;
         }
 
-        if let Some(zoom_delta) = touch_pinch_zoom {
-            let pinch_delta = zoom_delta.max(1e-4).ln();
-            if pinch_delta.abs() > 1e-4 {
-                let pinch_move = (pinch_delta * TOUCH_PINCH_MOVE_SCALE)
-                    .clamp(-TOUCH_PINCH_MAX_STEP, TOUCH_PINCH_MAX_STEP);
-                self.position = self.position + horizontal_forward * pinch_move;
-                changed = true;
+        if touch_pinch_active {
+            if let Some(zoom_delta) = touch_pinch_zoom {
+                let pinch_delta = zoom_delta.max(1e-4).ln();
+                if pinch_delta.abs() > 1e-4 {
+                    let pinch_move = (pinch_delta * TOUCH_PINCH_MOVE_SCALE)
+                        .clamp(-TOUCH_PINCH_MAX_STEP, TOUCH_PINCH_MAX_STEP);
+                    self.position = self.position + self.forward() * pinch_move;
+                    changed = true;
+                }
             }
         }
 
