@@ -45,6 +45,10 @@ const MATERIAL_METAL: u32 = 1u;
 const MATERIAL_GLOSSY: u32 = 2u;
 const MATERIAL_EMISSIVE: u32 = 3u;
 
+const FOG_BASE_DENSITY: f32 = 0.38;
+const FOG_MISS_DISTANCE: f32 = 0.95;
+const DISPLAY_EXPOSURE: f32 = 0.55;
+
 @group(0) @binding(0)
 var<uniform> uniforms: Uniforms;
 
@@ -313,6 +317,40 @@ fn scatter(ray_in: Ray, hit: Hit, prim: Primitive, rng_state: ptr<function, u32>
     return invalid_scatter();
 }
 
+fn fog_density(point: vec3<f32>) -> f32 {
+    let height = clamp(point.y, 0.0, 1.0);
+    let height_factor = 1.2 - 0.55 * height;
+    let swirl = 0.76 + 0.24 * sin(point.x * 17.0 + point.z * 11.0);
+    return FOG_BASE_DENSITY * height_factor * swirl;
+}
+
+fn fog_light(point: vec3<f32>, light_pos: vec3<f32>, tint: vec3<f32>) -> vec3<f32> {
+    let to_light = light_pos - point;
+    let dist2 = dot(to_light, to_light);
+    return tint / (1.0 + dist2 * 140.0);
+}
+
+fn fog_scatter_color(point: vec3<f32>) -> vec3<f32> {
+    let ambient = vec3<f32>(0.006, 0.008, 0.012) + vec3<f32>(0.005) * (1.0 - clamp(point.y, 0.0, 1.0));
+
+    var disco = vec3<f32>(0.0);
+    disco = disco + fog_light(point, vec3<f32>(0.31, 0.92, 0.34), vec3<f32>(0.95, 0.24, 0.84));
+    disco = disco + fog_light(point, vec3<f32>(0.69, 0.92, 0.32), vec3<f32>(0.23, 0.88, 0.96));
+    disco = disco + fog_light(point, vec3<f32>(0.72, 0.91, 0.70), vec3<f32>(0.55, 0.92, 0.26));
+    disco = disco + fog_light(point, vec3<f32>(0.28, 0.91, 0.72), vec3<f32>(0.96, 0.68, 0.18));
+
+    return ambient + disco * 0.34;
+}
+
+fn integrate_fog(ray: Ray, segment_distance: f32) -> vec4<f32> {
+    let distance = max(segment_distance, 0.0);
+    let midpoint = ray.origin + ray.direction * (0.5 * distance);
+    let density = fog_density(midpoint);
+    let transmittance = exp(-density * distance);
+    let scatter = fog_scatter_color(midpoint) * (1.0 - transmittance);
+    return vec4<f32>(scatter, transmittance);
+}
+
 fn trace_ray(initial_ray: Ray, rng_state: ptr<function, u32>) -> vec3<f32> {
     var ray = initial_ray;
     var throughput = vec3<f32>(1.0);
@@ -326,7 +364,13 @@ fn trace_ray(initial_ray: Ray, rng_state: ptr<function, u32>) -> vec3<f32> {
         }
 
         let hit = scene_hit(ray, 0.001, 1e20);
-        if !is_hit(hit) {
+        let did_hit = is_hit(hit);
+        let segment_distance = select(FOG_MISS_DISTANCE, hit.t, did_hit);
+        let fog = integrate_fog(ray, segment_distance);
+        radiance = radiance + throughput * fog.xyz;
+        throughput = throughput * fog.w;
+
+        if !did_hit {
             break;
         }
 
@@ -356,7 +400,7 @@ fn trace_ray(initial_ray: Ray, rng_state: ptr<function, u32>) -> vec3<f32> {
 }
 
 fn linear_to_display(color: vec3<f32>) -> vec3<f32> {
-    let positive = max(color, vec3<f32>(0.0));
+    let positive = max(color, vec3<f32>(0.0)) * DISPLAY_EXPOSURE;
     let mapped = positive / (vec3<f32>(1.0) + positive);
     return pow(mapped, vec3<f32>(1.0 / 2.2));
 }

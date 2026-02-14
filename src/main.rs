@@ -37,10 +37,6 @@ impl Vec3 {
         Self { x, y, z }
     }
 
-    const fn splat(v: f32) -> Self {
-        Self { x: v, y: v, z: v }
-    }
-
     fn dot(self, rhs: Self) -> f32 {
         self.x * rhs.x + self.y * rhs.y + self.z * rhs.z
     }
@@ -872,14 +868,14 @@ fn build_cornell_box_scene(camera_origin: Vec3) -> Scene {
     let mut objects = Vec::new();
 
     let white = Material::Diffuse {
-        albedo: Vec3::new(0.78, 0.78, 0.78),
+        albedo: Vec3::new(0.42, 0.42, 0.42),
     };
     let green = Material::Diffuse {
-        albedo: Vec3::new(0.18, 0.62, 0.22),
+        albedo: Vec3::new(0.09, 0.28, 0.14),
     };
     let metallic_wall = Material::Metal {
-        albedo: Vec3::new(0.9, 0.91, 0.93),
-        fuzz: 0.02,
+        albedo: Vec3::new(0.58, 0.6, 0.64),
+        fuzz: 0.05,
     };
     let glossy_box_a = Material::Glossy {
         albedo: Vec3::new(0.86, 0.76, 0.68),
@@ -891,21 +887,53 @@ fn build_cornell_box_scene(camera_origin: Vec3) -> Scene {
         roughness: 0.22,
         reflectivity: 0.2,
     };
-    let light = Material::Emissive {
-        color: Vec3::splat(15.0),
+    let fill_light = Material::Emissive {
+        color: Vec3::new(1.8, 1.75, 1.7),
     };
-    let duck_yellow = Material::Glossy {
-        albedo: Vec3::new(0.92, 0.82, 0.16),
+    let disco_magenta = Material::Emissive {
+        color: Vec3::new(5.8, 1.0, 4.7),
+    };
+    let disco_cyan = Material::Emissive {
+        color: Vec3::new(1.0, 4.9, 5.6),
+    };
+    let disco_lime = Material::Emissive {
+        color: Vec3::new(3.1, 5.0, 1.1),
+    };
+    let disco_amber = Material::Emissive {
+        color: Vec3::new(5.4, 3.3, 0.9),
+    };
+    let disco_ball = Material::Metal {
+        albedo: Vec3::new(0.94, 0.95, 0.97),
+        fuzz: 0.01,
+    };
+    let psyduck_yellow = Material::Glossy {
+        albedo: Vec3::new(0.94, 0.84, 0.19),
         roughness: 0.2,
-        reflectivity: 0.14,
+        reflectivity: 0.12,
     };
-    let duck_orange = Material::Glossy {
-        albedo: Vec3::new(0.96, 0.5, 0.1),
-        roughness: 0.24,
+    let psyduck_beak = Material::Glossy {
+        albedo: Vec3::new(0.94, 0.79, 0.49),
+        roughness: 0.25,
         reflectivity: 0.08,
     };
-    let duck_eye = Material::Diffuse {
-        albedo: Vec3::splat(0.03),
+    let psyduck_eye_white = Material::Diffuse {
+        albedo: Vec3::new(0.97, 0.97, 0.97),
+    };
+    let pokemon_detail = Material::Diffuse {
+        albedo: Vec3::new(0.05, 0.04, 0.04),
+    };
+    let pikachu_yellow = Material::Glossy {
+        albedo: Vec3::new(0.97, 0.86, 0.13),
+        roughness: 0.19,
+        reflectivity: 0.11,
+    };
+    let pikachu_cheek = Material::Glossy {
+        albedo: Vec3::new(0.9, 0.22, 0.2),
+        roughness: 0.25,
+        reflectivity: 0.08,
+    };
+    let pikachu_tail = Material::Diffuse {
+        albedo: Vec3::new(0.52, 0.3, 0.15),
     };
     let slowpoke_pink = Material::Glossy {
         albedo: Vec3::new(0.9, 0.63, 0.72),
@@ -919,7 +947,7 @@ fn build_cornell_box_scene(camera_origin: Vec3) -> Scene {
         albedo: Vec3::new(0.97, 0.97, 0.97),
     };
     let slowpoke_detail = Material::Diffuse {
-        albedo: Vec3::new(0.05, 0.03, 0.03),
+        albedo: Vec3::new(0.05, 0.04, 0.04),
     };
     let slowpoke_tail_tip = Material::Glossy {
         albedo: Vec3::new(0.94, 0.93, 0.93),
@@ -978,14 +1006,67 @@ fn build_cornell_box_scene(camera_origin: Vec3) -> Scene {
     }));
 
     objects.push(Primitive::XZ(RectXZ {
-        x0: 0.31,
-        x1: 0.69,
-        z0: 0.27,
-        z1: 0.73,
+        x0: 0.36,
+        x1: 0.64,
+        z0: 0.32,
+        z1: 0.68,
         y: 0.999,
         normal_y: -1.0,
-        material: light,
+        material: fill_light,
     }));
+
+    objects.push(Primitive::XZ(RectXZ {
+        x0: 0.09,
+        x1: 0.23,
+        z0: 0.12,
+        z1: 0.28,
+        y: 0.998,
+        normal_y: -1.0,
+        material: disco_magenta,
+    }));
+    objects.push(Primitive::XZ(RectXZ {
+        x0: 0.77,
+        x1: 0.91,
+        z0: 0.12,
+        z1: 0.28,
+        y: 0.998,
+        normal_y: -1.0,
+        material: disco_cyan,
+    }));
+    objects.push(Primitive::XZ(RectXZ {
+        x0: 0.77,
+        x1: 0.91,
+        z0: 0.72,
+        z1: 0.88,
+        y: 0.998,
+        normal_y: -1.0,
+        material: disco_lime,
+    }));
+    objects.push(Primitive::XZ(RectXZ {
+        x0: 0.09,
+        x1: 0.23,
+        z0: 0.72,
+        z1: 0.88,
+        y: 0.998,
+        normal_y: -1.0,
+        material: disco_amber,
+    }));
+
+    add_sphere(&mut objects, Vec3::new(0.5, 0.82, 0.52), 0.072, disco_ball);
+    add_sphere(
+        &mut objects,
+        Vec3::new(0.31, 0.92, 0.34),
+        0.029,
+        disco_magenta,
+    );
+    add_sphere(&mut objects, Vec3::new(0.69, 0.92, 0.32), 0.029, disco_cyan);
+    add_sphere(&mut objects, Vec3::new(0.72, 0.91, 0.70), 0.029, disco_lime);
+    add_sphere(
+        &mut objects,
+        Vec3::new(0.28, 0.91, 0.72),
+        0.029,
+        disco_amber,
+    );
 
     add_axis_aligned_box(
         &mut objects,
@@ -1000,13 +1081,24 @@ fn build_cornell_box_scene(camera_origin: Vec3) -> Scene {
         glossy_box_b,
     );
 
-    add_rubber_duck(
+    add_psyduck(
         &mut objects,
         Vec3::new(0.72, 0.69, 0.41),
         camera_origin,
-        duck_yellow,
-        duck_orange,
-        duck_eye,
+        psyduck_yellow,
+        psyduck_beak,
+        psyduck_eye_white,
+        pokemon_detail,
+    );
+
+    add_pikachu(
+        &mut objects,
+        Vec3::new(0.30, 0.43, 0.72),
+        camera_origin,
+        pikachu_yellow,
+        pokemon_detail,
+        pikachu_cheek,
+        pikachu_tail,
     );
 
     add_slowpoke(
@@ -1088,19 +1180,20 @@ fn add_sphere(objects: &mut Vec<Primitive>, center: Vec3, radius: f32, material:
     }));
 }
 
-fn add_rubber_duck(
+fn add_psyduck(
     objects: &mut Vec<Primitive>,
     perch: Vec3,
     camera_origin: Vec3,
     yellow: Material,
-    orange: Material,
-    eye: Material,
+    beak: Material,
+    eye_white: Material,
+    detail: Material,
 ) {
-    let body_radius = 0.058;
+    let body_radius = 0.06;
     let body_center = Vec3::new(perch.x, perch.y + body_radius + 0.0015, perch.z);
 
     let to_camera = (camera_origin - body_center).normalized();
-    let forward = Vec3::new(to_camera.x, to_camera.y * 0.35, to_camera.z).normalized();
+    let forward = Vec3::new(to_camera.x, to_camera.y * 0.25, to_camera.z).normalized();
 
     let world_up = Vec3::new(0.0, 1.0, 0.0);
     let mut right = forward.cross(world_up);
@@ -1113,50 +1206,245 @@ fn add_rubber_duck(
     add_sphere(objects, body_center, body_radius, yellow);
     add_sphere(
         objects,
-        body_center + forward * 0.026 + up * 0.01,
-        0.048,
-        yellow,
-    );
-    add_sphere(
-        objects,
-        body_center - forward * 0.052 + up * 0.014,
-        0.021,
-        yellow,
-    );
-    add_sphere(
-        objects,
-        body_center - right * 0.045 + up * 0.009,
-        0.021,
-        yellow,
-    );
-    add_sphere(
-        objects,
-        body_center + right * 0.045 + up * 0.009,
-        0.021,
+        body_center - forward * 0.041 + up * 0.008,
+        0.046,
         yellow,
     );
 
-    let head_center = body_center + forward * 0.054 + up * 0.062;
-    add_sphere(objects, head_center, 0.034, yellow);
+    let head_center = body_center + forward * 0.03 + up * 0.073;
+    add_sphere(objects, head_center, 0.046, yellow);
     add_sphere(
         objects,
-        head_center + forward * 0.014 + up * 0.001,
-        0.023,
+        head_center + forward * 0.018 + up * 0.006,
+        0.034,
         yellow,
     );
 
-    let beak_center = head_center + forward * 0.038 - up * 0.005;
-    add_sphere(objects, beak_center, 0.013, orange);
+    let beak_center = head_center + forward * 0.048 - up * 0.012;
+    add_sphere(objects, beak_center, 0.023, beak);
     add_sphere(
         objects,
-        beak_center + forward * 0.007 - up * 0.01,
-        0.0105,
-        orange,
+        beak_center + forward * 0.013 - up * 0.006,
+        0.015,
+        beak,
     );
 
-    let eye_base = head_center + forward * 0.026 + up * 0.01;
-    add_sphere(objects, eye_base - right * 0.012, 0.0045, eye);
-    add_sphere(objects, eye_base + right * 0.012, 0.0045, eye);
+    add_sphere(
+        objects,
+        body_center + forward * 0.026 - right * 0.055 + up * 0.006,
+        0.018,
+        yellow,
+    );
+    add_sphere(
+        objects,
+        body_center + forward * 0.026 + right * 0.055 + up * 0.006,
+        0.018,
+        yellow,
+    );
+
+    let foot_y = perch.y + 0.017;
+    let foot_drop = body_center.y - foot_y;
+    add_sphere(
+        objects,
+        body_center + forward * 0.03 - right * 0.03 - world_up * foot_drop,
+        0.017,
+        yellow,
+    );
+    add_sphere(
+        objects,
+        body_center + forward * 0.03 + right * 0.03 - world_up * foot_drop,
+        0.017,
+        yellow,
+    );
+
+    let eye_base = head_center + forward * 0.024 + up * 0.016;
+    add_sphere(objects, eye_base - right * 0.016, 0.0085, eye_white);
+    add_sphere(objects, eye_base + right * 0.016, 0.0085, eye_white);
+    add_sphere(
+        objects,
+        eye_base - right * 0.016 + forward * 0.004,
+        0.0038,
+        detail,
+    );
+    add_sphere(
+        objects,
+        eye_base + right * 0.016 + forward * 0.004,
+        0.0038,
+        detail,
+    );
+
+    let hair_root = head_center + up * 0.046 - forward * 0.006;
+    add_sphere(
+        objects,
+        hair_root - right * 0.01 + up * 0.018,
+        0.006,
+        detail,
+    );
+    add_sphere(objects, hair_root + up * 0.024, 0.0065, detail);
+    add_sphere(
+        objects,
+        hair_root + right * 0.01 + up * 0.018,
+        0.006,
+        detail,
+    );
+}
+
+fn add_pikachu(
+    objects: &mut Vec<Primitive>,
+    perch: Vec3,
+    camera_origin: Vec3,
+    yellow: Material,
+    detail: Material,
+    cheek: Material,
+    tail: Material,
+) {
+    let body_radius = 0.066;
+    let body_center = Vec3::new(perch.x, perch.y + body_radius + 0.0015, perch.z);
+
+    let to_camera = (camera_origin - body_center).normalized();
+    let forward = Vec3::new(to_camera.x, to_camera.y * 0.18, to_camera.z).normalized();
+
+    let world_up = Vec3::new(0.0, 1.0, 0.0);
+    let mut right = forward.cross(world_up);
+    if right.length_squared() < 1e-6 {
+        right = Vec3::new(1.0, 0.0, 0.0);
+    }
+    right = right.normalized();
+    let up = right.cross(forward).normalized();
+
+    add_sphere(objects, body_center, body_radius, yellow);
+    add_sphere(
+        objects,
+        body_center + forward * 0.022 + up * 0.01,
+        0.055,
+        yellow,
+    );
+
+    let head_center = body_center + forward * 0.045 + up * 0.075;
+    add_sphere(objects, head_center, 0.054, yellow);
+    add_sphere(
+        objects,
+        head_center + forward * 0.02 + up * 0.008,
+        0.042,
+        yellow,
+    );
+
+    let ear_base = head_center + up * 0.046;
+    let left_ear = ear_base - right * 0.032;
+    add_sphere(
+        objects,
+        left_ear + up * 0.024 - forward * 0.002,
+        0.018,
+        yellow,
+    );
+    add_sphere(
+        objects,
+        left_ear + up * 0.049 - forward * 0.004,
+        0.015,
+        yellow,
+    );
+    add_sphere(
+        objects,
+        left_ear + up * 0.071 - forward * 0.006,
+        0.01,
+        detail,
+    );
+
+    let right_ear = ear_base + right * 0.032;
+    add_sphere(
+        objects,
+        right_ear + up * 0.024 - forward * 0.002,
+        0.018,
+        yellow,
+    );
+    add_sphere(
+        objects,
+        right_ear + up * 0.049 - forward * 0.004,
+        0.015,
+        yellow,
+    );
+    add_sphere(
+        objects,
+        right_ear + up * 0.071 - forward * 0.006,
+        0.01,
+        detail,
+    );
+
+    add_sphere(
+        objects,
+        body_center + forward * 0.032 - right * 0.056 + up * 0.008,
+        0.019,
+        yellow,
+    );
+    add_sphere(
+        objects,
+        body_center + forward * 0.032 + right * 0.056 + up * 0.008,
+        0.019,
+        yellow,
+    );
+
+    let foot_y = perch.y + 0.018;
+    let foot_drop = body_center.y - foot_y;
+    add_sphere(
+        objects,
+        body_center + forward * 0.038 - right * 0.034 - world_up * foot_drop,
+        0.02,
+        yellow,
+    );
+    add_sphere(
+        objects,
+        body_center + forward * 0.038 + right * 0.034 - world_up * foot_drop,
+        0.02,
+        yellow,
+    );
+
+    let cheek_base = head_center + forward * 0.04 - up * 0.004;
+    add_sphere(objects, cheek_base - right * 0.026, 0.011, cheek);
+    add_sphere(objects, cheek_base + right * 0.026, 0.011, cheek);
+
+    let eye_base = head_center + forward * 0.038 + up * 0.013;
+    add_sphere(objects, eye_base - right * 0.017, 0.0072, detail);
+    add_sphere(objects, eye_base + right * 0.017, 0.0072, detail);
+    add_sphere(
+        objects,
+        head_center + forward * 0.051 - up * 0.005,
+        0.0042,
+        detail,
+    );
+
+    let tail_base = body_center - forward * 0.055 + up * 0.025 + right * 0.01;
+    add_sphere(objects, tail_base, 0.016, tail);
+    add_sphere(
+        objects,
+        tail_base - forward * 0.038 + up * 0.028 + right * 0.016,
+        0.014,
+        tail,
+    );
+    add_sphere(
+        objects,
+        tail_base - forward * 0.064 + up * 0.055 + right * 0.03,
+        0.012,
+        tail,
+    );
+    add_sphere(
+        objects,
+        tail_base - forward * 0.08 + up * 0.079 + right * 0.044,
+        0.01,
+        yellow,
+    );
+
+    add_sphere(
+        objects,
+        body_center - forward * 0.024 - right * 0.021 + up * 0.018,
+        0.01,
+        tail,
+    );
+    add_sphere(
+        objects,
+        body_center - forward * 0.024 + right * 0.021 + up * 0.018,
+        0.01,
+        tail,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
