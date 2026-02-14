@@ -1,7 +1,7 @@
 use bytemuck::{Pod, Zeroable};
 use crossbeam_channel::Sender;
 use eframe::{egui, wgpu};
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::ops::{Add, Div, Mul, Neg, Sub};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -284,7 +284,9 @@ struct FpsCamera {
     pitch: f32,
     fov_degrees: f32,
     aspect: f32,
-    active_touch_ids: BTreeSet<egui::TouchId>,
+    active_touches: BTreeMap<egui::TouchId, egui::Pos2>,
+    last_single_touch: Option<(egui::TouchId, egui::Pos2)>,
+    pinch_was_active: bool,
 }
 
 impl FpsCamera {
@@ -299,7 +301,9 @@ impl FpsCamera {
             pitch,
             fov_degrees,
             aspect,
-            active_touch_ids: BTreeSet::new(),
+            active_touches: BTreeMap::new(),
+            last_single_touch: None,
+            pinch_was_active: false,
         }
     }
 
@@ -342,8 +346,8 @@ impl FpsCamera {
                 .events
                 .iter()
                 .filter_map(|event| {
-                    if let egui::Event::Touch { id, phase, .. } = event {
-                        Some((*id, *phase))
+                    if let egui::Event::Touch { id, phase, pos, .. } = event {
+                        Some((*id, *phase, *pos))
                     } else {
                         None
                     }
@@ -363,45 +367,68 @@ impl FpsCamera {
             )
         });
 
-        for (touch_id, phase) in touch_events {
+        for (touch_id, phase, pos) in touch_events {
             match phase {
                 egui::TouchPhase::Start | egui::TouchPhase::Move => {
-                    self.active_touch_ids.insert(touch_id);
+                    self.active_touches.insert(touch_id, pos);
                 }
                 egui::TouchPhase::End | egui::TouchPhase::Cancel => {
-                    self.active_touch_ids.remove(&touch_id);
+                    self.active_touches.remove(&touch_id);
                 }
             }
         }
 
         if !any_touches {
-            self.active_touch_ids.clear();
+            self.active_touches.clear();
         }
 
-        let mut touch_count = self.active_touch_ids.len();
+        let mut touch_count = self.active_touches.len();
         if any_touches && touch_count == 0 {
             touch_count = if touch_pinch_zoom.is_some() { 2 } else { 1 };
         }
         let touch_look_active = touch_count == 1;
         let touch_pinch_active = touch_count >= 2;
 
+        let touch_look_delta = if touch_look_active {
+            if let Some((&touch_id, &touch_pos)) = self.active_touches.iter().next() {
+                let mut delta = egui::Vec2::ZERO;
+                if let Some((last_id, last_pos)) = self.last_single_touch {
+                    if last_id == touch_id {
+                        delta = touch_pos - last_pos;
+                    }
+                }
+                self.last_single_touch = Some((touch_id, touch_pos));
+                delta
+            } else {
+                egui::Vec2::ZERO
+            }
+        } else {
+            self.last_single_touch = None;
+            egui::Vec2::ZERO
+        };
+
         let mut changed = false;
-        if (right_mouse_down || touch_look_active)
-            && (pointer_delta.x.abs() > f32::EPSILON || pointer_delta.y.abs() > f32::EPSILON)
-        {
-            let look_sensitivity = if right_mouse_down {
-                CAMERA_LOOK_SENSITIVITY
+        if right_mouse_down || touch_look_active {
+            let look_delta = if right_mouse_down {
+                pointer_delta
             } else {
-                TOUCH_LOOK_SENSITIVITY
+                touch_look_delta
             };
-            let pitch_delta = if right_mouse_down {
-                -pointer_delta.y * look_sensitivity
-            } else {
-                pointer_delta.y * look_sensitivity
-            };
-            self.yaw += pointer_delta.x * look_sensitivity;
-            self.pitch = (self.pitch + pitch_delta).clamp(-1.52, 1.52);
-            changed = true;
+            if look_delta.x.abs() > f32::EPSILON || look_delta.y.abs() > f32::EPSILON {
+                let look_sensitivity = if right_mouse_down {
+                    CAMERA_LOOK_SENSITIVITY
+                } else {
+                    TOUCH_LOOK_SENSITIVITY
+                };
+                let pitch_delta = if right_mouse_down {
+                    -look_delta.y * look_sensitivity
+                } else {
+                    look_delta.y * look_sensitivity
+                };
+                self.yaw += look_delta.x * look_sensitivity;
+                self.pitch = (self.pitch + pitch_delta).clamp(-1.52, 1.52);
+                changed = true;
+            }
         }
 
         let mut horizontal_forward = self.forward();
@@ -440,16 +467,19 @@ impl FpsCamera {
         }
 
         if touch_pinch_active {
-            if let Some(zoom_delta) = touch_pinch_zoom {
-                let pinch_delta = zoom_delta.max(1e-4).ln();
-                if pinch_delta.abs() > 1e-4 {
-                    let pinch_move = (pinch_delta * TOUCH_PINCH_MOVE_SCALE)
-                        .clamp(-TOUCH_PINCH_MAX_STEP, TOUCH_PINCH_MAX_STEP);
-                    self.position = self.position + self.forward() * pinch_move;
-                    changed = true;
+            if self.pinch_was_active {
+                if let Some(zoom_delta) = touch_pinch_zoom {
+                    let pinch_delta = zoom_delta.max(1e-4).ln();
+                    if pinch_delta.abs() > 1e-4 {
+                        let pinch_move = (pinch_delta * TOUCH_PINCH_MOVE_SCALE)
+                            .clamp(-TOUCH_PINCH_MAX_STEP, TOUCH_PINCH_MAX_STEP);
+                        self.position = self.position + self.forward() * pinch_move;
+                        changed = true;
+                    }
                 }
             }
         }
+        self.pinch_was_active = touch_pinch_active;
 
         changed
     }
