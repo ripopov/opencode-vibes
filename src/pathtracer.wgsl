@@ -45,6 +45,9 @@ const MATERIAL_METAL: u32 = 1u;
 const MATERIAL_GLOSSY: u32 = 2u;
 const MATERIAL_EMISSIVE: u32 = 3u;
 
+const RENDER_MODE_PATH: u32 = 0u;
+const RENDER_MODE_FAST: u32 = 1u;
+
 const FOG_BASE_DENSITY: f32 = 0.38;
 const FOG_MISS_DISTANCE: f32 = 0.95;
 const DISPLAY_EXPOSURE: f32 = 0.55;
@@ -351,6 +354,62 @@ fn integrate_fog(ray: Ray, segment_distance: f32) -> vec4<f32> {
     return vec4<f32>(scatter, transmittance);
 }
 
+fn party_light(point: vec3<f32>, normal: vec3<f32>, light_pos: vec3<f32>, tint: vec3<f32>) -> vec3<f32> {
+    let to_light = light_pos - point;
+    let dist2 = dot(to_light, to_light);
+    let light_dir = safe_normalize(to_light);
+    let diffuse = max(dot(normal, light_dir), 0.0);
+    return tint * diffuse / (1.0 + dist2 * 110.0);
+}
+
+fn fast_surface_shading(ray: Ray, hit: Hit, prim: Primitive) -> vec3<f32> {
+    let albedo = prim.color.xyz;
+    var lighting = vec3<f32>(0.012, 0.014, 0.02);
+
+    lighting = lighting + party_light(hit.point, hit.normal, vec3<f32>(0.31, 0.92, 0.34), vec3<f32>(0.95, 0.24, 0.84));
+    lighting = lighting + party_light(hit.point, hit.normal, vec3<f32>(0.69, 0.92, 0.32), vec3<f32>(0.23, 0.88, 0.96));
+    lighting = lighting + party_light(hit.point, hit.normal, vec3<f32>(0.72, 0.91, 0.70), vec3<f32>(0.55, 0.92, 0.26));
+    lighting = lighting + party_light(hit.point, hit.normal, vec3<f32>(0.28, 0.91, 0.72), vec3<f32>(0.96, 0.68, 0.18));
+    lighting = lighting + party_light(hit.point, hit.normal, vec3<f32>(0.50, 0.999, 0.50), vec3<f32>(0.36, 0.34, 0.33));
+
+    var shaded = albedo * lighting * 2.2;
+
+    let view_dir = -ray.direction;
+    let rim = pow(clamp(1.0 - max(dot(hit.normal, view_dir), 0.0), 0.0, 1.0), 2.0);
+    shaded = shaded + albedo * rim * 0.08;
+
+    if prim.header.y == MATERIAL_METAL || prim.header.y == MATERIAL_GLOSSY {
+        let highlight_dir = safe_normalize(view_dir + vec3<f32>(0.18, 0.95, 0.23));
+        let spec_power = select(22.0, 48.0, prim.header.y == MATERIAL_METAL);
+        let spec_strength = select(0.14, 0.3, prim.header.y == MATERIAL_METAL);
+        let spec = pow(max(dot(hit.normal, highlight_dir), 0.0), spec_power) * spec_strength;
+        shaded = shaded + vec3<f32>(spec);
+    }
+
+    return shaded;
+}
+
+fn trace_fast(ray: Ray) -> vec3<f32> {
+    let hit = scene_hit(ray, 0.001, 1e20);
+    let did_hit = is_hit(hit);
+    let segment_distance = select(FOG_MISS_DISTANCE, hit.t, did_hit);
+    let fog = integrate_fog(ray, segment_distance);
+
+    var radiance = fog.xyz;
+    if !did_hit {
+        return radiance;
+    }
+
+    let prim = primitives[hit.prim_index];
+    radiance = radiance + fog.w * emitted(prim);
+
+    if prim.header.y != MATERIAL_EMISSIVE {
+        radiance = radiance + fog.w * fast_surface_shading(ray, hit, prim);
+    }
+
+    return radiance;
+}
+
 fn trace_ray(initial_ray: Ray, rng_state: ptr<function, u32>) -> vec3<f32> {
     var ray = initial_ray;
     var throughput = vec3<f32>(1.0);
@@ -413,21 +472,37 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
+    let render_mode = uniforms.frame.z;
     var rng_state = init_rng(gid.xy, uniforms.frame.x, uniforms.frame.y);
 
     let denom_x = f32(max(width, 2u) - 1u);
     let denom_y = f32(max(height, 2u) - 1u);
-    let u = (f32(gid.x) + rand_f32(&rng_state)) / denom_x;
-    let v = (f32(height - 1u - gid.y) + rand_f32(&rng_state)) / denom_y;
+
+    var jitter = vec2<f32>(0.5, 0.5);
+    if render_mode == RENDER_MODE_PATH {
+        jitter = vec2<f32>(rand_f32(&rng_state), rand_f32(&rng_state));
+    }
+
+    let u = (f32(gid.x) + jitter.x) / denom_x;
+    let v = (f32(height - 1u - gid.y) + jitter.y) / denom_y;
 
     let origin = uniforms.origin.xyz;
     let direction = safe_normalize(
         uniforms.lower_left.xyz + uniforms.horizontal.xyz * u + uniforms.vertical.xyz * v - origin,
     );
 
+    let idx = gid.y * width + gid.x;
+
+    if render_mode == RENDER_MODE_FAST {
+        let fast_color = trace_fast(Ray(origin, direction));
+        accumulation[idx] = vec4<f32>(0.0);
+        let gamma = linear_to_display(fast_color);
+        textureStore(output_tex, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(gamma, 1.0));
+        return;
+    }
+
     let sample = trace_ray(Ray(origin, direction), &rng_state);
 
-    let idx = gid.y * width + gid.x;
     let prev = accumulation[idx];
     let sum = prev.xyz + sample;
     let spp = prev.w + 1.0;

@@ -12,8 +12,12 @@ use std::time::{Duration, Instant};
 const IMAGE_WIDTH: usize = 640;
 const IMAGE_HEIGHT: usize = 640;
 const MAX_BOUNCES: u32 = 10;
+const FAST_BOUNCES: u32 = 1;
 const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(3);
 const SNAPSHOT_FILE: &str = "snapshot.png";
+const CAMERA_MOVE_SPEED: f32 = 1.8;
+const CAMERA_LOOK_SENSITIVITY: f32 = 0.0028;
+const CAMERA_IDLE_TO_PATH: Duration = Duration::from_secs(1);
 
 const PRIMITIVE_XY: u32 = 0;
 const PRIMITIVE_XZ: u32 = 1;
@@ -24,6 +28,9 @@ const MATERIAL_DIFFUSE: u32 = 0;
 const MATERIAL_METAL: u32 = 1;
 const MATERIAL_GLOSSY: u32 = 2;
 const MATERIAL_EMISSIVE: u32 = 3;
+
+const RENDER_MODE_PATH: u32 = 0;
+const RENDER_MODE_FAST: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct Vec3 {
@@ -218,6 +225,149 @@ impl Camera {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RenderMode {
+    Path,
+    Fast,
+}
+
+impl RenderMode {
+    const fn as_gpu(self) -> u32 {
+        match self {
+            Self::Path => RENDER_MODE_PATH,
+            Self::Fast => RENDER_MODE_FAST,
+        }
+    }
+
+    const fn bounces(self) -> u32 {
+        match self {
+            Self::Path => MAX_BOUNCES,
+            Self::Fast => FAST_BOUNCES,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Path => "Path tracing",
+            Self::Fast => "Fast raytracer",
+        }
+    }
+}
+
+struct FpsCamera {
+    position: Vec3,
+    yaw: f32,
+    pitch: f32,
+    fov_degrees: f32,
+    aspect: f32,
+}
+
+impl FpsCamera {
+    fn from_look_at(look_from: Vec3, look_at: Vec3, fov_degrees: f32, aspect: f32) -> Self {
+        let forward = (look_at - look_from).normalized();
+        let yaw = forward.x.atan2(forward.z);
+        let pitch = forward.y.clamp(-0.999, 0.999).asin();
+
+        Self {
+            position: look_from,
+            yaw,
+            pitch,
+            fov_degrees,
+            aspect,
+        }
+    }
+
+    fn forward(&self) -> Vec3 {
+        let cos_pitch = self.pitch.cos();
+        Vec3::new(
+            self.yaw.sin() * cos_pitch,
+            self.pitch.sin(),
+            self.yaw.cos() * cos_pitch,
+        )
+        .normalized()
+    }
+
+    fn to_camera(&self) -> Camera {
+        let forward = self.forward();
+        Camera::new(
+            self.position,
+            self.position + forward,
+            Vec3::new(0.0, 1.0, 0.0),
+            self.fov_degrees,
+            self.aspect,
+        )
+    }
+
+    fn update_from_input(&mut self, ctx: &egui::Context, dt_seconds: f32) -> bool {
+        let (
+            pointer_delta,
+            right_mouse_down,
+            boost,
+            move_forward,
+            move_back,
+            move_left,
+            move_right,
+        ) = ctx.input(|input| {
+            (
+                input.pointer.delta(),
+                input.pointer.button_down(egui::PointerButton::Secondary),
+                input.modifiers.shift,
+                input.key_down(egui::Key::W),
+                input.key_down(egui::Key::S),
+                input.key_down(egui::Key::A),
+                input.key_down(egui::Key::D),
+            )
+        });
+
+        let mut changed = false;
+        if right_mouse_down
+            && (pointer_delta.x.abs() > f32::EPSILON || pointer_delta.y.abs() > f32::EPSILON)
+        {
+            self.yaw += pointer_delta.x * CAMERA_LOOK_SENSITIVITY;
+            self.pitch =
+                (self.pitch - pointer_delta.y * CAMERA_LOOK_SENSITIVITY).clamp(-1.52, 1.52);
+            changed = true;
+        }
+
+        let mut horizontal_forward = self.forward();
+        horizontal_forward.y = 0.0;
+        if horizontal_forward.length_squared() > 1e-6 {
+            horizontal_forward = horizontal_forward.normalized();
+        } else {
+            horizontal_forward = Vec3::new(0.0, 0.0, 1.0);
+        }
+
+        let mut right = Vec3::new(horizontal_forward.z, 0.0, -horizontal_forward.x);
+        if right.length_squared() > 1e-6 {
+            right = right.normalized();
+        } else {
+            right = Vec3::new(1.0, 0.0, 0.0);
+        }
+
+        let mut movement = Vec3::new(0.0, 0.0, 0.0);
+        if move_forward {
+            movement = movement + horizontal_forward;
+        }
+        if move_back {
+            movement = movement - horizontal_forward;
+        }
+        if move_right {
+            movement = movement - right;
+        }
+        if move_left {
+            movement = movement + right;
+        }
+
+        if movement.length_squared() > 0.0 {
+            let speed = CAMERA_MOVE_SPEED * if boost { 1.8 } else { 1.0 };
+            self.position = self.position + movement.normalized() * (speed * dt_seconds.max(0.0));
+            changed = true;
+        }
+
+        changed
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct GpuUniforms {
@@ -236,11 +386,13 @@ impl GpuUniforms {
         primitive_count: u32,
         sample_index: u32,
         seed: u32,
+        render_mode: RenderMode,
+        max_bounces: u32,
         camera: Camera,
     ) -> Self {
         Self {
-            dims: [width, height, primitive_count, MAX_BOUNCES],
-            frame: [sample_index, seed, 0, 0],
+            dims: [width, height, primitive_count, max_bounces],
+            frame: [sample_index, seed, render_mode.as_gpu(), 0],
             origin: [camera.origin.x, camera.origin.y, camera.origin.z, 0.0],
             lower_left: [
                 camera.lower_left.x,
@@ -278,7 +430,7 @@ struct GpuPathTracer {
     camera: Camera,
     uniform_buffer: wgpu::Buffer,
     _primitive_buffer: wgpu::Buffer,
-    _accumulation_buffer: wgpu::Buffer,
+    accumulation_buffer: wgpu::Buffer,
     output_texture: wgpu::Texture,
     _output_view: wgpu::TextureView,
     texture_id: egui::TextureId,
@@ -287,7 +439,10 @@ struct GpuPathTracer {
     bind_group: wgpu::BindGroup,
     compute_pipeline: wgpu::ComputePipeline,
     sample_index: u32,
+    preview_frame_index: u32,
     seed: u32,
+    render_mode: RenderMode,
+    accumulation_dirty: bool,
 }
 
 impl GpuPathTracer {
@@ -337,7 +492,7 @@ impl GpuPathTracer {
         let accumulation_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("pathtracer-accumulation"),
             size: pixel_count * std::mem::size_of::<[f32; 4]>() as u64,
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
@@ -471,7 +626,7 @@ impl GpuPathTracer {
             camera,
             uniform_buffer,
             _primitive_buffer: primitive_buffer,
-            _accumulation_buffer: accumulation_buffer,
+            accumulation_buffer,
             output_texture,
             _output_view: output_view,
             texture_id,
@@ -480,17 +635,32 @@ impl GpuPathTracer {
             bind_group,
             compute_pipeline,
             sample_index: 0,
+            preview_frame_index: 0,
             seed: 0x1234_5678,
+            render_mode: RenderMode::Path,
+            accumulation_dirty: true,
         })
     }
 
     fn render_sample(&mut self) {
+        if self.render_mode == RenderMode::Path && self.accumulation_dirty {
+            self.clear_accumulation();
+            self.sample_index = 0;
+        }
+
+        let frame_index = match self.render_mode {
+            RenderMode::Path => self.sample_index,
+            RenderMode::Fast => self.preview_frame_index,
+        };
+
         let uniforms = GpuUniforms::new(
             self.width,
             self.height,
             self.primitive_count,
-            self.sample_index,
+            frame_index,
             self.seed,
+            self.render_mode,
+            self.render_mode.bounces(),
             self.camera,
         );
         self.queue
@@ -514,11 +684,49 @@ impl GpuPathTracer {
 
         self.queue.submit(Some(encoder.finish()));
 
-        self.sample_index = self.sample_index.saturating_add(1);
+        match self.render_mode {
+            RenderMode::Path => {
+                self.sample_index = self.sample_index.saturating_add(1);
+            }
+            RenderMode::Fast => {
+                self.sample_index = 0;
+                self.preview_frame_index = self.preview_frame_index.saturating_add(1);
+            }
+        }
+
         self.seed = self
             .seed
             .wrapping_mul(1_664_525)
             .wrapping_add(1_013_904_223);
+    }
+
+    fn set_camera(&mut self, camera: Camera) {
+        self.camera = camera;
+        self.sample_index = 0;
+        self.accumulation_dirty = true;
+    }
+
+    fn set_render_mode(&mut self, render_mode: RenderMode) {
+        if self.render_mode == render_mode {
+            return;
+        }
+
+        self.render_mode = render_mode;
+        if render_mode == RenderMode::Path {
+            self.sample_index = 0;
+            self.accumulation_dirty = true;
+        }
+    }
+
+    fn clear_accumulation(&mut self) {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("pathtracer-clear-accumulation"),
+            });
+        encoder.clear_buffer(&self.accumulation_buffer, 0, None);
+        self.queue.submit(Some(encoder.finish()));
+        self.accumulation_dirty = false;
     }
 
     fn readback_output(&self, output: &mut [u8]) -> Result<(), String> {
@@ -610,11 +818,15 @@ struct PathTracerApp {
     gpu: Option<GpuPathTracer>,
     gpu_texture_id: Option<egui::TextureId>,
     init_error: Option<String>,
+    fps_camera: FpsCamera,
+    render_mode: RenderMode,
     rgba_buffer: Vec<u8>,
     stop_flag: Arc<AtomicBool>,
     snapshot_sender: Option<Sender<SnapshotFrame>>,
     snapshot_thread: Option<JoinHandle<()>>,
     last_snapshot: Instant,
+    last_camera_motion: Instant,
+    last_frame_time: Instant,
     dump_interval: Duration,
     started_at: Instant,
 }
@@ -635,13 +847,13 @@ impl PathTracerApp {
 
         let camera_origin = Vec3::new(0.5, 0.5, -2.2);
         let camera_target = Vec3::new(0.5, 0.5, 0.5);
-        let camera = Camera::new(
+        let fps_camera = FpsCamera::from_look_at(
             camera_origin,
             camera_target,
-            Vec3::new(0.0, 1.0, 0.0),
             40.0,
             IMAGE_WIDTH as f32 / IMAGE_HEIGHT as f32,
         );
+        let camera = fps_camera.to_camera();
         let scene = build_cornell_box_scene(camera_origin);
 
         let (gpu, init_error) = match cc.wgpu_render_state.as_ref() {
@@ -675,13 +887,49 @@ impl PathTracerApp {
             gpu,
             gpu_texture_id,
             init_error,
+            fps_camera,
+            render_mode: RenderMode::Path,
             rgba_buffer: vec![0_u8; IMAGE_WIDTH * IMAGE_HEIGHT * 4],
             stop_flag,
             snapshot_sender: Some(snapshot_sender),
             snapshot_thread,
             last_snapshot: Instant::now(),
+            last_camera_motion: Instant::now() - CAMERA_IDLE_TO_PATH,
+            last_frame_time: Instant::now(),
             dump_interval: SNAPSHOT_INTERVAL,
             started_at: Instant::now(),
+        }
+    }
+
+    fn update_camera_and_mode(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        let dt_seconds = now
+            .saturating_duration_since(self.last_frame_time)
+            .as_secs_f32()
+            .clamp(0.0, 0.1);
+        self.last_frame_time = now;
+
+        let camera_changed = self.fps_camera.update_from_input(ctx, dt_seconds);
+        if camera_changed {
+            self.last_camera_motion = now;
+            let camera = self.fps_camera.to_camera();
+            if let Some(gpu) = &mut self.gpu {
+                gpu.set_camera(camera);
+            }
+        }
+
+        let target_mode =
+            if now.saturating_duration_since(self.last_camera_motion) >= CAMERA_IDLE_TO_PATH {
+                RenderMode::Path
+            } else {
+                RenderMode::Fast
+            };
+
+        if target_mode != self.render_mode {
+            self.render_mode = target_mode;
+            if let Some(gpu) = &mut self.gpu {
+                gpu.set_render_mode(target_mode);
+            }
         }
     }
 
@@ -716,6 +964,8 @@ impl PathTracerApp {
 
 impl eframe::App for PathTracerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.update_camera_and_mode(ctx);
+
         if let Some(gpu) = &mut self.gpu {
             gpu.render_sample();
             self.maybe_queue_snapshot();
@@ -724,6 +974,16 @@ impl eframe::App for PathTracerApp {
         let elapsed = self.started_at.elapsed().as_secs_f32();
         let sample_count = self.gpu.as_ref().map_or(0, GpuPathTracer::sample_count);
         let total_samples = self.gpu.as_ref().map_or(0, GpuPathTracer::total_samples);
+        let sample_label = if self.render_mode == RenderMode::Path {
+            format!("Samples per pixel: {sample_count}")
+        } else {
+            "Samples per pixel: realtime".to_owned()
+        };
+        let total_label = if self.render_mode == RenderMode::Path {
+            format!("Total samples: {total_samples}")
+        } else {
+            "Total samples: paused".to_owned()
+        };
 
         egui::TopBottomPanel::top("status").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -731,14 +991,17 @@ impl eframe::App for PathTracerApp {
                 ui.separator();
                 ui.label("Backend: WGPU/WGSL");
                 ui.separator();
-                ui.label(format!("Samples per pixel: {}", sample_count));
+                ui.label(format!("Mode: {}", self.render_mode.label()));
                 ui.separator();
-                ui.label(format!("Total samples: {}", total_samples));
+                ui.label(sample_label.as_str());
+                ui.separator();
+                ui.label(total_label.as_str());
                 ui.separator();
                 ui.label(format!("Elapsed: {:.1}s", elapsed));
                 ui.separator();
                 ui.label(format!("Snapshot: {}", SNAPSHOT_FILE));
             });
+            ui.label("Controls: WASD move, hold right mouse + drag to look");
 
             if let Some(err) = &self.init_error {
                 ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
