@@ -32,6 +32,8 @@ const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(3);
 const SNAPSHOT_FILE: &str = "snapshot.png";
 const CAMERA_MOVE_SPEED: f32 = 1.8;
 const CAMERA_LOOK_SENSITIVITY: f32 = 0.0028;
+const TOUCH_LOOK_SENSITIVITY: f32 = 0.0034;
+const TOUCH_PINCH_MOVE_SCALE: f32 = 1.2;
 const CAMERA_IDLE_TO_PATH: Duration = Duration::from_secs(1);
 
 #[cfg(target_arch = "wasm32")]
@@ -322,15 +324,20 @@ impl FpsCamera {
         let (
             pointer_delta,
             right_mouse_down,
+            touch_look_active,
+            touch_pinch_zoom,
             boost,
             move_forward,
             move_back,
             move_left,
             move_right,
         ) = ctx.input(|input| {
+            let multi_touch = input.multi_touch();
             (
                 input.pointer.delta(),
                 input.pointer.button_down(egui::PointerButton::Secondary),
+                input.any_touches() && multi_touch.is_none(),
+                multi_touch.map(|touch| touch.zoom_delta),
                 input.modifiers.shift,
                 input.key_down(egui::Key::W),
                 input.key_down(egui::Key::S),
@@ -340,12 +347,16 @@ impl FpsCamera {
         });
 
         let mut changed = false;
-        if right_mouse_down
+        if (right_mouse_down || touch_look_active)
             && (pointer_delta.x.abs() > f32::EPSILON || pointer_delta.y.abs() > f32::EPSILON)
         {
-            self.yaw += pointer_delta.x * CAMERA_LOOK_SENSITIVITY;
-            self.pitch =
-                (self.pitch - pointer_delta.y * CAMERA_LOOK_SENSITIVITY).clamp(-1.52, 1.52);
+            let look_sensitivity = if right_mouse_down {
+                CAMERA_LOOK_SENSITIVITY
+            } else {
+                TOUCH_LOOK_SENSITIVITY
+            };
+            self.yaw += pointer_delta.x * look_sensitivity;
+            self.pitch = (self.pitch - pointer_delta.y * look_sensitivity).clamp(-1.52, 1.52);
             changed = true;
         }
 
@@ -382,6 +393,15 @@ impl FpsCamera {
             let speed = CAMERA_MOVE_SPEED * if boost { 1.8 } else { 1.0 };
             self.position = self.position + movement.normalized() * (speed * dt_seconds.max(0.0));
             changed = true;
+        }
+
+        if let Some(zoom_delta) = touch_pinch_zoom {
+            let pinch_delta = zoom_delta.max(1e-4).ln();
+            if pinch_delta.abs() > 1e-4 {
+                self.position =
+                    self.position + horizontal_forward * (pinch_delta * TOUCH_PINCH_MOVE_SCALE);
+                changed = true;
+            }
         }
 
         changed
@@ -1046,7 +1066,7 @@ impl eframe::App for PathTracerApp {
                 ui.separator();
                 ui.label(snapshot_label.as_str());
             });
-            ui.label("Controls: WASD move, hold right mouse + drag to look");
+            ui.label("Controls: WASD move, hold right mouse + drag to look, one-finger drag to look, pinch to move forward/backward");
 
             if let Some(err) = &self.init_error {
                 ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
