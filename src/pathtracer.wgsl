@@ -49,7 +49,6 @@ const RENDER_MODE_PATH: u32 = 0u;
 const RENDER_MODE_FAST: u32 = 1u;
 
 const FOG_BASE_DENSITY: f32 = 0.38;
-const FOG_MISS_DISTANCE: f32 = 0.95;
 const DISPLAY_EXPOSURE: f32 = 0.55;
 
 @group(0) @binding(0)
@@ -85,6 +84,34 @@ fn reflect(v: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
 
 fn max_component(v: vec3<f32>) -> f32 {
     return max(max(v.x, v.y), v.z);
+}
+
+fn hash31(p: vec3<f32>) -> f32 {
+    let n = dot(p, vec3<f32>(127.1, 311.7, 74.7));
+    return fract(sin(n) * 43758.5453123);
+}
+
+fn night_sky(direction: vec3<f32>) -> vec3<f32> {
+    let dir = safe_normalize(direction);
+    var sky = vec3<f32>(0.0);
+
+    let moon_dir = safe_normalize(vec3<f32>(-0.18, 0.24, 0.95));
+    let moon_alignment = clamp(dot(dir, moon_dir), 0.0, 1.0);
+    let moon_glow = smoothstep(0.992, 0.9995, moon_alignment);
+    let moon_disc = smoothstep(0.9996, 0.99992, moon_alignment);
+    let moon_color = vec3<f32>(0.88, 0.9, 1.0);
+    sky = sky + moon_color * (moon_glow * 0.22 + moon_disc * 3.4);
+
+    let star_grid = floor((dir + vec3<f32>(1.0)) * 820.0);
+    let star_seed = hash31(star_grid);
+    let star_mask = step(0.9972, star_seed) * smoothstep(-0.18, 0.08, dir.y);
+    let star_variation = pow(hash31(star_grid + vec3<f32>(19.0, 47.0, 73.0)), 6.0);
+    let star_intensity = star_mask * (0.2 + star_variation * 1.4);
+    let star_tint = vec3<f32>(0.72, 0.79, 1.0)
+        + vec3<f32>(0.55, 0.36, 0.15) * hash31(star_grid + vec3<f32>(2.0, 11.0, 37.0));
+
+    sky = sky + star_tint * star_intensity;
+    return sky;
 }
 
 fn init_rng(pixel: vec2<u32>, sample_index: u32, seed: u32) -> u32 {
@@ -334,15 +361,13 @@ fn fog_light(point: vec3<f32>, light_pos: vec3<f32>, tint: vec3<f32>) -> vec3<f3
 }
 
 fn fog_scatter_color(point: vec3<f32>) -> vec3<f32> {
-    let ambient = vec3<f32>(0.006, 0.008, 0.012) + vec3<f32>(0.005) * (1.0 - clamp(point.y, 0.0, 1.0));
-
     var disco = vec3<f32>(0.0);
     disco = disco + fog_light(point, vec3<f32>(0.31, 0.92, 0.34), vec3<f32>(0.95, 0.24, 0.84));
     disco = disco + fog_light(point, vec3<f32>(0.69, 0.92, 0.32), vec3<f32>(0.23, 0.88, 0.96));
     disco = disco + fog_light(point, vec3<f32>(0.72, 0.91, 0.70), vec3<f32>(0.55, 0.92, 0.26));
     disco = disco + fog_light(point, vec3<f32>(0.28, 0.91, 0.72), vec3<f32>(0.96, 0.68, 0.18));
 
-    return ambient + disco * 0.34;
+    return disco * 0.34;
 }
 
 fn integrate_fog(ray: Ray, segment_distance: f32) -> vec4<f32> {
@@ -364,7 +389,7 @@ fn party_light(point: vec3<f32>, normal: vec3<f32>, light_pos: vec3<f32>, tint: 
 
 fn fast_surface_shading(ray: Ray, hit: Hit, prim: Primitive) -> vec3<f32> {
     let albedo = prim.color.xyz;
-    var lighting = vec3<f32>(0.012, 0.014, 0.02);
+    var lighting = vec3<f32>(0.0);
 
     lighting = lighting + party_light(hit.point, hit.normal, vec3<f32>(0.31, 0.92, 0.34), vec3<f32>(0.95, 0.24, 0.84));
     lighting = lighting + party_light(hit.point, hit.normal, vec3<f32>(0.69, 0.92, 0.32), vec3<f32>(0.23, 0.88, 0.96));
@@ -391,14 +416,12 @@ fn fast_surface_shading(ray: Ray, hit: Hit, prim: Primitive) -> vec3<f32> {
 
 fn trace_fast(ray: Ray) -> vec3<f32> {
     let hit = scene_hit(ray, 0.001, 1e20);
-    let did_hit = is_hit(hit);
-    let segment_distance = select(FOG_MISS_DISTANCE, hit.t, did_hit);
-    let fog = integrate_fog(ray, segment_distance);
-
-    var radiance = fog.xyz;
-    if !did_hit {
-        return radiance;
+    if !is_hit(hit) {
+        return night_sky(ray.direction);
     }
+
+    let fog = integrate_fog(ray, hit.t);
+    var radiance = fog.xyz;
 
     let prim = primitives[hit.prim_index];
     radiance = radiance + fog.w * emitted(prim);
@@ -423,15 +446,14 @@ fn trace_ray(initial_ray: Ray, rng_state: ptr<function, u32>) -> vec3<f32> {
         }
 
         let hit = scene_hit(ray, 0.001, 1e20);
-        let did_hit = is_hit(hit);
-        let segment_distance = select(FOG_MISS_DISTANCE, hit.t, did_hit);
-        let fog = integrate_fog(ray, segment_distance);
-        radiance = radiance + throughput * fog.xyz;
-        throughput = throughput * fog.w;
-
-        if !did_hit {
+        if !is_hit(hit) {
+            radiance = radiance + throughput * night_sky(ray.direction);
             break;
         }
+
+        let fog = integrate_fog(ray, hit.t);
+        radiance = radiance + throughput * fog.xyz;
+        throughput = throughput * fog.w;
 
         let prim = primitives[hit.prim_index];
         radiance = radiance + throughput * emitted(prim);
